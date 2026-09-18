@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"meilirize/internal/config"
 	"meilirize/internal/smtpd"
+	"meilirize/internal/storage/sqlite"
 )
 
 func newServeCommand(configPath *string, newResolver configResolverFactory) *cobra.Command {
@@ -15,7 +17,7 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 		Short:   "Run the server in the foreground",
 		GroupID: groupRuntime,
 		Args:    cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
+		RunE: func(command *cobra.Command, _ []string) (runError error) {
 			sources, err := resolveConfigSources(*configPath, newResolver)
 			if err != nil {
 				return err
@@ -24,6 +26,13 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 			if err != nil {
 				return err
 			}
+			store, err := sqlite.Open(command.Context(), configuration.Database.Path)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				runError = errors.Join(runError, store.Close())
+			}()
 
 			resolvedListeners, err := configuration.SMTP.ResolvedListeners()
 			if err != nil {

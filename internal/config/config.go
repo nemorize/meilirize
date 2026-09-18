@@ -13,6 +13,7 @@ const (
 	SMTPHostnameEnvironment       = EnvironmentPrefix + "SMTP_HOSTNAME"
 	SMTPTLSCertEnvironment        = EnvironmentPrefix + "SMTP_TLS_CERT_FILE"
 	SMTPTLSKeyEnvironment         = EnvironmentPrefix + "SMTP_TLS_KEY_FILE"
+	DatabasePathEnvironment       = EnvironmentPrefix + "DATABASE_PATH"
 
 	SMTPModePlain    = "plain"
 	SMTPModeStartTLS = "starttls"
@@ -20,7 +21,8 @@ const (
 )
 
 type Config struct {
-	SMTP SMTPConfig `toml:"smtp"`
+	SMTP     SMTPConfig     `toml:"smtp"`
+	Database DatabaseConfig `toml:"database"`
 }
 
 type SMTPConfig struct {
@@ -41,11 +43,18 @@ type SMTPTLSConfig struct {
 	KeyFile  string `toml:"key_file"`
 }
 
+type DatabaseConfig struct {
+	Path string `toml:"path"`
+}
+
 func Defaults() Config {
 	return Config{
 		SMTP: SMTPConfig{
 			ListenPlain: "127.0.0.1:2525",
 			Hostname:    "localhost",
+		},
+		Database: DatabaseConfig{
+			Path: "meilirize.db",
 		},
 	}
 }
@@ -57,6 +66,9 @@ func (configuration Config) Validate() error {
 	}
 	if strings.ContainsAny(hostname, " \t\r\n") {
 		return fmt.Errorf("smtp.hostname must not contain whitespace")
+	}
+	if configuration.Database.Path == "" {
+		return fmt.Errorf("database.path must not be empty")
 	}
 
 	listeners, err := configuration.SMTP.ResolvedListeners()

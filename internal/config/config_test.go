@@ -72,6 +72,9 @@ hostname = "file.example"
 [smtp.tls]
 cert_file = "file-cert.pem"
 key_file = "file-key.pem"
+
+[database]
+path = "file.db"
 `)
 	sources := newSources(path, FileSelectedByFlag)
 	environment := map[string]string{
@@ -81,6 +84,7 @@ key_file = "file-key.pem"
 		SMTPHostnameEnvironment:       "env.example",
 		SMTPTLSCertEnvironment:        "env-cert.pem",
 		SMTPTLSKeyEnvironment:         "env-key.pem",
+		DatabasePathEnvironment:       "env.db",
 	}
 
 	configuration, err := load(sources, func(name string) (string, bool) {
@@ -107,6 +111,9 @@ key_file = "file-key.pem"
 	}
 	if configuration.SMTP.TLS.KeyFile != "env-key.pem" {
 		t.Fatalf("smtp TLS key file = %q", configuration.SMTP.TLS.KeyFile)
+	}
+	if configuration.Database.Path != "env.db" {
+		t.Fatalf("database path = %q", configuration.Database.Path)
 	}
 }
 
@@ -158,6 +165,9 @@ func TestLoadRejectsInvalidSMTPSettings(t *testing.T) {
 		},
 		"no listeners": {
 			SMTPListenPlainEnvironment: "",
+		},
+		"database path": {
+			DatabasePathEnvironment: "",
 		},
 		"STARTTLS listen": {
 			SMTPListenStartTLSEnvironment: "2587",

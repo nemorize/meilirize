@@ -50,6 +50,9 @@ func load(sources Sources, lookupEnvironment func(string) (string, bool)) (Confi
 		if value, ok := lookupEnvironment(SMTPTLSKeyEnvironment); ok {
 			configuration.SMTP.TLS.KeyFile = value
 		}
+		if value, ok := lookupEnvironment(DatabasePathEnvironment); ok {
+			configuration.Database.Path = value
+		}
 	}
 
 	if err := configuration.Validate(); err != nil {
