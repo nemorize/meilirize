@@ -29,7 +29,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 	assertPragma(t, store.database, "busy_timeout", "5000")
 	assertPragma(t, store.database, "journal_mode", "wal")
 	assertPragma(t, store.database, "synchronous", "1")
-	assertMigrationCount(t, store.database, 3)
+	assertMigrationCount(t, store.database, 4)
 
 	var name string
 	if err := store.database.QueryRowContext(
@@ -58,7 +58,117 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	assertMigrationCount(t, reopened.database, 3)
+	assertMigrationCount(t, reopened.database, 4)
+}
+
+func TestRecreatedInboxReceivesNewUIDValidity(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAddress, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "recreated@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstInbox, err := store.MailboxByName(ctx, firstAddress.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.database.ExecContext(ctx, "DELETE FROM addresses WHERE id = ?", firstAddress.ID); err != nil {
+		t.Fatal(err)
+	}
+	secondAddress, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "recreated@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInbox, err := store.MailboxByName(ctx, secondAddress.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if secondAddress.ID != firstAddress.ID {
+		t.Fatalf("address ID was not reused: first=%d second=%d", firstAddress.ID, secondAddress.ID)
+	}
+	if secondInbox.UIDValidity <= firstInbox.UIDValidity {
+		t.Fatalf(
+			"UIDVALIDITY did not increase: first=%d second=%d",
+			firstInbox.UIDValidity,
+			secondInbox.UIDValidity,
+		)
+	}
+}
+
+func TestUIDValiditySequenceMigratesExistingMailboxes(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	if _, err := database.ExecContext(ctx, createMigrationsTable); err != nil {
+		t.Fatal(err)
+	}
+	migrations, err := loadMigrations(migrationFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range migrations[:3] {
+		if err := applyMigration(ctx, database, migration); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &Store{database: database}
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAddress, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "upgrade@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstInbox, err := store.MailboxByName(ctx, firstAddress.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrate(ctx, database, migrationFiles); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, "DELETE FROM addresses WHERE id = ?", firstAddress.ID); err != nil {
+		t.Fatal(err)
+	}
+	secondAddress, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "upgrade@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInbox, err := store.MailboxByName(ctx, secondAddress.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondInbox.UIDValidity <= firstInbox.UIDValidity {
+		t.Fatalf(
+			"UIDVALIDITY after migration did not increase: first=%d second=%d",
+			firstInbox.UIDValidity,
+			secondInbox.UIDValidity,
+		)
+	}
 }
 
 func TestIngestStoresMessageMetadataAndOriginalBytes(t *testing.T) {
