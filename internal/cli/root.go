@@ -58,7 +58,7 @@ func NewRootCommand(info buildinfo.Info) *cobra.Command {
 	)
 
 	root.AddCommand(
-		newPlaceholderCommand("serve", "Run the server in the foreground", groupRuntime),
+		newServeCommand(&configPath, config.NewResolver),
 		newDoctorCommand(&configPath, config.NewResolver),
 		newVersionCommand(info),
 	)

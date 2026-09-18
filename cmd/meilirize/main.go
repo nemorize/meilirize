@@ -3,14 +3,19 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"meilirize/internal/buildinfo"
 	"meilirize/internal/cli"
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	err := cli.Execute(
-		context.Background(),
+		ctx,
 		os.Args[1:],
 		os.Stdin,
 		os.Stdout,

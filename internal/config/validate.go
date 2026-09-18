@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 
@@ -8,18 +9,39 @@ import (
 )
 
 func Validate(sources Sources) error {
-	if !sources.HasFile() {
-		return nil
+	_, err := Load(sources)
+	return err
+}
+
+func Load(sources Sources) (Config, error) {
+	return load(sources, os.LookupEnv)
+}
+
+func load(sources Sources, lookupEnvironment func(string) (string, bool)) (Config, error) {
+	configuration := Defaults()
+
+	if sources.HasFile() {
+		contents, err := os.ReadFile(sources.FilePath)
+		if err != nil {
+			return Config{}, fmt.Errorf("read config file %q: %w", sources.FilePath, err)
+		}
+		decoder := toml.NewDecoder(bytes.NewReader(contents)).DisallowUnknownFields()
+		if err := decoder.Decode(&configuration); err != nil {
+			return Config{}, fmt.Errorf("parse config file %q: %w", sources.FilePath, err)
+		}
 	}
 
-	contents, err := os.ReadFile(sources.FilePath)
-	if err != nil {
-		return fmt.Errorf("read config file %q: %w", sources.FilePath, err)
+	if lookupEnvironment != nil {
+		if value, ok := lookupEnvironment(SMTPListenEnvironment); ok {
+			configuration.SMTP.Listen = value
+		}
+		if value, ok := lookupEnvironment(SMTPHostnameEnvironment); ok {
+			configuration.SMTP.Hostname = value
+		}
 	}
 
-	var document map[string]any
-	if err := toml.Unmarshal(contents, &document); err != nil {
-		return fmt.Errorf("parse config file %q: %w", sources.FilePath, err)
+	if err := configuration.Validate(); err != nil {
+		return Config{}, fmt.Errorf("validate configuration: %w", err)
 	}
-	return nil
+	return configuration, nil
 }

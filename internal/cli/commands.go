@@ -43,18 +43,6 @@ func resolveConfigSources(configPath string, newResolver configResolverFactory) 
 	return resolver.Resolve(configPath)
 }
 
-func newPlaceholderCommand(use, short, group string) *cobra.Command {
-	return &cobra.Command{
-		Use:     use,
-		Short:   short,
-		GroupID: group,
-		Args:    cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
-			return command.Help()
-		},
-	}
-}
-
 func newVersionCommand(info buildinfo.Info) *cobra.Command {
 	return &cobra.Command{
 		Use:     "version",

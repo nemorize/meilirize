@@ -10,9 +10,10 @@ It is designed to turn provider APIs and webhooks into:
 - A provider-independent email experience
 
 > [!NOTE]
-> Meilirize is in early development. Authenticated SMTP submission and
-> outbound delivery are available today. Inbound mail, IMAP, POP, webmail,
-> and mobile apps are not implemented yet.
+> Meilirize is in early development. An experimental SMTP endpoint is
+> available for protocol development, but it does not accept or deliver mail
+> yet. Authentication, TLS, inbound delivery, submission, IMAP, POP, webmail,
+> and mobile apps are not implemented.
 
 ## License
 

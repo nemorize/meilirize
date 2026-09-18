@@ -48,8 +48,8 @@ func TestRootHelpListsCommandGroups(t *testing.T) {
 	}
 }
 
-func TestPlaceholderCommandOnlyShowsHelp(t *testing.T) {
-	output, err := executeForTest("serve")
+func TestServeHelp(t *testing.T) {
+	output, err := executeForTest("serve", "--help")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,11 @@ func TestPlaceholderCommandOnlyShowsHelp(t *testing.T) {
 
 func TestDoctorValidatesConfigurationWithoutShowingValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(configPath, []byte("[server]\nport = 2525\n"), 0o600); err != nil {
+	if err := os.WriteFile(
+		configPath,
+		[]byte("[smtp]\nlisten = \"127.0.0.1:2525\"\nhostname = \"mail.example\"\n"),
+		0o600,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -71,7 +75,7 @@ func TestDoctorValidatesConfigurationWithoutShowingValues(t *testing.T) {
 	if output != "Configuration: OK\n" {
 		t.Fatalf("unexpected output: %q", output)
 	}
-	for _, secret := range []string{configPath, "server", "2525"} {
+	for _, secret := range []string{configPath, "smtp", "2525", "mail.example"} {
 		if strings.Contains(output, secret) {
 			t.Errorf("doctor output exposes %q: %s", secret, output)
 		}
