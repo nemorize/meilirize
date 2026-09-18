@@ -10,6 +10,7 @@ import (
 var (
 	ErrInvalidKey = errors.New("invalid blob key")
 	ErrNotFound   = errors.New("blob not found")
+	ErrCorrupt    = errors.New("blob integrity check failed")
 )
 
 type Ref struct {
@@ -31,6 +32,7 @@ type GarbageCollectionResult struct {
 
 type Store interface {
 	Put(context.Context, io.Reader) (Ref, error)
-	Open(context.Context, string) (io.ReadCloser, error)
+	Open(context.Context, Ref) (io.ReadCloser, error)
+	Verify(context.Context, Ref) error
 	CollectGarbage(context.Context, GarbageCollection) (GarbageCollectionResult, error)
 }

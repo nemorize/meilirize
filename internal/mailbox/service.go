@@ -2,6 +2,7 @@ package mailbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -64,7 +65,7 @@ func (service *Service) Ingest(
 	if err != nil {
 		return StoredMessage{}, fmt.Errorf("store raw message: %w", err)
 	}
-	metadata, err := service.readMetadata(ctx, reference.Key)
+	metadata, err := service.readMetadata(ctx, reference)
 	if err != nil {
 		return StoredMessage{}, err
 	}
@@ -98,7 +99,11 @@ func (service *Service) OpenRaw(ctx context.Context, messageID int64) (io.ReadCl
 	if err != nil {
 		return nil, err
 	}
-	reader, err := service.blobs.Open(ctx, message.BlobKey)
+	reader, err := service.blobs.Open(ctx, blob.Ref{
+		Key:    message.BlobKey,
+		SHA256: message.BlobSHA256,
+		Size:   message.RawSize,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("open raw message %d: %w", messageID, err)
 	}
@@ -118,9 +123,13 @@ func (service *Service) CollectGarbage(
 	service.lifecycle.Lock()
 	defer service.lifecycle.Unlock()
 
-	liveKeys, err := service.repository.ReferencedBlobKeys(ctx)
+	references, err := service.repository.ReferencedBlobs(ctx)
 	if err != nil {
 		return blob.GarbageCollectionResult{}, err
+	}
+	liveKeys := make(map[string]struct{}, len(references))
+	for _, reference := range references {
+		liveKeys[reference.Key] = struct{}{}
 	}
 	result, err := service.blobs.CollectGarbage(ctx, blob.GarbageCollection{
 		LiveKeys:     liveKeys,
@@ -130,6 +139,34 @@ func (service *Service) CollectGarbage(
 		return result, fmt.Errorf("collect message blobs: %w", err)
 	}
 	return result, nil
+}
+
+func (service *Service) VerifyBlobs(
+	ctx context.Context,
+) (BlobVerificationResult, error) {
+	service.lifecycle.RLock()
+	defer service.lifecycle.RUnlock()
+
+	references, err := service.repository.ReferencedBlobs(ctx)
+	if err != nil {
+		return BlobVerificationResult{}, err
+	}
+	result := BlobVerificationResult{}
+	var verificationErrors []error
+	for _, reference := range references {
+		if err := service.blobs.Verify(ctx, reference); err != nil {
+			if ctx.Err() != nil {
+				return result, fmt.Errorf("verify message blobs: %w", ctx.Err())
+			}
+			result.Failed++
+			verificationErrors = append(
+				verificationErrors,
+				fmt.Errorf("verify blob %q: %w", reference.Key, err),
+			)
+		}
+		result.Checked++
+	}
+	return result, errors.Join(verificationErrors...)
 }
 
 func (service *Service) RunGarbageCollection(
@@ -164,18 +201,28 @@ type parsedMetadata struct {
 	sentAt       time.Time
 }
 
-func (service *Service) readMetadata(ctx context.Context, key string) (parsedMetadata, error) {
-	reader, err := service.blobs.Open(ctx, key)
+func (service *Service) readMetadata(
+	ctx context.Context,
+	reference blob.Ref,
+) (metadata parsedMetadata, resultError error) {
+	reader, err := service.blobs.Open(ctx, reference)
 	if err != nil {
 		return parsedMetadata{}, fmt.Errorf("open stored message for parsing: %w", err)
 	}
-	defer reader.Close()
+	defer func() {
+		if closeError := reader.Close(); closeError != nil {
+			resultError = errors.Join(
+				resultError,
+				fmt.Errorf("verify stored message after parsing: %w", closeError),
+			)
+		}
+	}()
 
 	message, err := mail.ReadMessage(reader)
 	if err != nil {
 		return parsedMetadata{}, fmt.Errorf("parse raw message: %w", err)
 	}
-	metadata := parsedMetadata{
+	metadata = parsedMetadata{
 		messageID: strings.TrimSpace(message.Header.Get("Message-ID")),
 		subject:   decodeHeader(message.Header.Get("Subject")),
 	}

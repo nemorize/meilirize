@@ -3,6 +3,8 @@ package mailbox
 import (
 	"context"
 	"time"
+
+	"meilirize/internal/blob"
 )
 
 type SpecialUse string
@@ -82,6 +84,11 @@ type StoredMessage struct {
 	MailboxMessage MailboxMessage
 }
 
+type BlobVerificationResult struct {
+	Checked int
+	Failed  int
+}
+
 type CreateMessageParams struct {
 	MailboxID          int64
 	BlobKey            string
@@ -102,5 +109,5 @@ type MessageRepository interface {
 	MailboxByName(context.Context, int64, string) (Mailbox, error)
 	Message(context.Context, int64) (Message, error)
 	CreateMessage(context.Context, CreateMessageParams) (StoredMessage, error)
-	ReferencedBlobKeys(context.Context) (map[string]struct{}, error)
+	ReferencedBlobs(context.Context) ([]blob.Ref, error)
 }

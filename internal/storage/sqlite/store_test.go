@@ -30,7 +30,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 	assertPragma(t, store.database, "busy_timeout", "5000")
 	assertPragma(t, store.database, "journal_mode", "wal")
 	assertPragma(t, store.database, "synchronous", "1")
-	assertMigrationCount(t, store.database, 5)
+	assertMigrationCount(t, store.database, 6)
 
 	var name string
 	if err := store.database.QueryRowContext(
@@ -59,7 +59,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	assertMigrationCount(t, reopened.database, 5)
+	assertMigrationCount(t, reopened.database, 6)
 }
 
 func TestRecreatedInboxReceivesNewUIDValidity(t *testing.T) {
@@ -320,6 +320,61 @@ func TestIngestStoresMessageMetadataAndOriginalBytes(t *testing.T) {
 	}
 }
 
+func TestOpenRawDetectsCorruptBlob(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	blobPath := filepath.Join(t.TempDir(), "blobs")
+	blobStore, err := local.New(blobPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := mailbox.NewService(store, blobStore)
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "integrity@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := "From: sender@example.com\r\n\r\noriginal body"
+	stored, err := service.Ingest(
+		ctx,
+		mailbox.IngestParams{MailboxID: inbox.ID},
+		strings.NewReader(raw),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := strings.TrimPrefix(stored.Message.BlobKey, "sha256/")
+	path := filepath.Join(blobPath, "sha256", hash[:2], hash[2:])
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", len(raw))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := service.OpenRaw(ctx, stored.Message.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, readError := io.ReadAll(reader)
+	closeError := reader.Close()
+	if !errors.Is(errors.Join(readError, closeError), blob.ErrCorrupt) {
+		t.Fatalf("read corrupt raw message error = %v", errors.Join(readError, closeError))
+	}
+}
+
 func TestCreateMessageRollsBackMetadataAndUIDOnFailure(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
@@ -427,6 +482,78 @@ func TestCreateMessageRollsBackWhenResultCannotBeAssembled(t *testing.T) {
 	}
 	if unchangedInbox.UIDNext != 1 {
 		t.Fatalf("UIDNEXT after result assembly failure = %d", unchangedInbox.UIDNext)
+	}
+}
+
+func TestStoreEnforcesBlobReferenceRelationship(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "blob-reference@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	_, err = store.CreateMessage(ctx, mailbox.CreateMessageParams{
+		MailboxID:    inbox.ID,
+		BlobKey:      "sha256/" + strings.Repeat("0", 64),
+		BlobSHA256:   strings.Repeat("1", 64),
+		ReceivedAt:   now,
+		InternalDate: now,
+	})
+	if !errors.Is(err, mailbox.ErrInvalid) {
+		t.Fatalf("mismatched application blob reference error = %v", err)
+	}
+
+	validHash := strings.Repeat("0", 64)
+	result, err := store.database.ExecContext(
+		ctx,
+		`INSERT INTO messages (blob_key, blob_sha256, raw_size, received_at)
+         VALUES (?, ?, 0, ?)`,
+		"sha256/"+validHash,
+		validHash,
+		now.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.database.ExecContext(
+		ctx,
+		"UPDATE messages SET blob_key = ? WHERE id = ?",
+		"sha256/"+strings.Repeat("1", 64),
+		messageID,
+	); err == nil {
+		t.Fatal("database accepted mismatched blob key and SHA-256")
+	}
+	invalidHash := strings.Repeat("g", 64)
+	if _, err := store.database.ExecContext(
+		ctx,
+		`INSERT INTO messages (blob_key, blob_sha256, raw_size, received_at)
+         VALUES (?, ?, 0, ?)`,
+		"sha256/"+invalidHash,
+		invalidHash,
+		now.Format(time.RFC3339Nano),
+	); err == nil {
+		t.Fatal("database accepted a non-hexadecimal blob SHA-256")
 	}
 }
 
@@ -538,7 +665,11 @@ func TestDeletingAddressPrunesMessageAndCollectsBlob(t *testing.T) {
 	if result.Deleted != 1 {
 		t.Fatalf("garbage collection result = %#v", result)
 	}
-	if _, err := blobStore.Open(ctx, stored.Message.BlobKey); !errors.Is(err, blob.ErrNotFound) {
+	if _, err := blobStore.Open(ctx, blob.Ref{
+		Key:    stored.Message.BlobKey,
+		SHA256: stored.Message.BlobSHA256,
+		Size:   stored.Message.RawSize,
+	}); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("deleted blob open error = %v", err)
 	}
 }

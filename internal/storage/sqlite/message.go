@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"meilirize/internal/blob"
 	"meilirize/internal/mailbox"
 )
 
@@ -105,25 +106,29 @@ func messageByID(ctx context.Context, queries messageQuerier, id int64) (mailbox
 	return message, nil
 }
 
-func (store *Store) ReferencedBlobKeys(ctx context.Context) (map[string]struct{}, error) {
-	rows, err := store.database.QueryContext(ctx, "SELECT DISTINCT blob_key FROM messages")
+func (store *Store) ReferencedBlobs(ctx context.Context) ([]blob.Ref, error) {
+	rows, err := store.database.QueryContext(
+		ctx,
+		`SELECT DISTINCT blob_key, blob_sha256, raw_size
+         FROM messages ORDER BY blob_key, blob_sha256, raw_size`,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("read referenced blob keys: %w", err)
+		return nil, fmt.Errorf("read referenced blobs: %w", err)
 	}
 	defer rows.Close()
 
-	keys := make(map[string]struct{})
+	references := make([]blob.Ref, 0)
 	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, fmt.Errorf("scan referenced blob key: %w", err)
+		var reference blob.Ref
+		if err := rows.Scan(&reference.Key, &reference.SHA256, &reference.Size); err != nil {
+			return nil, fmt.Errorf("scan referenced blob: %w", err)
 		}
-		keys[key] = struct{}{}
+		references = append(references, reference)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate referenced blob keys: %w", err)
+		return nil, fmt.Errorf("iterate referenced blobs: %w", err)
 	}
-	return keys, nil
+	return references, nil
 }
 
 func (store *Store) CreateMessage(
@@ -183,6 +188,9 @@ func validateMessageParams(params mailbox.CreateMessageParams) error {
 	}
 	if _, err := hex.DecodeString(params.BlobSHA256); err != nil {
 		return fmt.Errorf("%w: blob SHA-256 must be lowercase hexadecimal", mailbox.ErrInvalid)
+	}
+	if params.BlobKey != "sha256/"+params.BlobSHA256 {
+		return fmt.Errorf("%w: blob key must match blob SHA-256", mailbox.ErrInvalid)
 	}
 	if params.RawSize < 0 {
 		return fmt.Errorf("%w: raw message size must not be negative", mailbox.ErrInvalid)

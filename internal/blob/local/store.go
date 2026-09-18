@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -44,8 +45,8 @@ func New(root string) (*Store, error) {
 }
 
 func (store *Store) Put(ctx context.Context, source io.Reader) (reference blob.Ref, resultError error) {
-	store.mutex.RLock()
-	defer store.mutex.RUnlock()
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
 
 	if source == nil {
 		return blob.Ref{}, fmt.Errorf("store local blob: source must not be nil")
@@ -89,6 +90,7 @@ func (store *Store) Put(ctx context.Context, source io.Reader) (reference blob.R
 
 	hash := hex.EncodeToString(digest.Sum(nil))
 	key := algorithmDirectory + "/" + hash
+	reference = blob.Ref{Key: key, SHA256: hash, Size: size}
 	destination, err := store.pathForKey(key)
 	if err != nil {
 		return blob.Ref{}, err
@@ -96,38 +98,56 @@ func (store *Store) Put(ctx context.Context, source io.Reader) (reference blob.R
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return blob.Ref{}, fmt.Errorf("create local blob shard: %w", err)
 	}
-	if _, err := os.Stat(destination); err == nil {
-		return blob.Ref{Key: key, SHA256: hash, Size: size}, nil
-	} else if !os.IsNotExist(err) {
-		return blob.Ref{}, fmt.Errorf("inspect local blob: %w", err)
+	existingError := verifyFile(ctx, destination, reference)
+	if existingError == nil {
+		return reference, nil
+	}
+	if !errors.Is(existingError, blob.ErrNotFound) && !errors.Is(existingError, blob.ErrCorrupt) {
+		return blob.Ref{}, fmt.Errorf("verify existing local blob: %w", existingError)
 	}
 	if err := os.Rename(temporaryPath, destination); err != nil {
-		if _, statError := os.Stat(destination); statError != nil {
-			return blob.Ref{}, fmt.Errorf("commit local blob: %w", err)
+		if verificationError := verifyFile(ctx, destination, reference); verificationError != nil {
+			return blob.Ref{}, errors.Join(
+				fmt.Errorf("commit local blob: %w", err),
+				fmt.Errorf("verify concurrently stored local blob: %w", verificationError),
+			)
 		}
 	}
-	return blob.Ref{Key: key, SHA256: hash, Size: size}, nil
+	return reference, nil
 }
 
-func (store *Store) Open(ctx context.Context, key string) (io.ReadCloser, error) {
+func (store *Store) Open(ctx context.Context, reference blob.Ref) (io.ReadCloser, error) {
 	store.mutex.RLock()
 	defer store.mutex.RUnlock()
 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("open local blob: %w", err)
 	}
-	path, err := store.pathForKey(key)
+	path, err := store.pathForReference(reference)
 	if err != nil {
 		return nil, err
 	}
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return nil, fmt.Errorf("open local blob %q: %w", key, blob.ErrNotFound)
+		return nil, fmt.Errorf("open local blob %q: %w", reference.Key, blob.ErrNotFound)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("open local blob %q: %w", key, err)
+		return nil, fmt.Errorf("open local blob %q: %w", reference.Key, err)
 	}
-	return file, nil
+	return newVerifyingReader(ctx, file, reference), nil
+}
+
+func (store *Store) Verify(ctx context.Context, reference blob.Ref) error {
+	reader, err := store.Open(ctx, reference)
+	if err != nil {
+		return err
+	}
+	_, readError := io.Copy(io.Discard, reader)
+	closeError := reader.Close()
+	if readError != nil {
+		return readError
+	}
+	return closeError
 }
 
 func (store *Store) CollectGarbage(
@@ -226,6 +246,26 @@ func (store *Store) pathForKey(key string) (string, error) {
 	return filepath.Join(store.root, algorithmDirectory, hash[:2], hash[2:]), nil
 }
 
+func (store *Store) pathForReference(reference blob.Ref) (string, error) {
+	path, err := store.pathForKey(reference.Key)
+	if err != nil {
+		return "", err
+	}
+	expectedHash := strings.TrimPrefix(reference.Key, algorithmDirectory+"/")
+	if reference.SHA256 != expectedHash {
+		return "", fmt.Errorf(
+			"%w: key %q does not match SHA-256 %q",
+			blob.ErrCorrupt,
+			reference.Key,
+			reference.SHA256,
+		)
+	}
+	if reference.Size < 0 {
+		return "", fmt.Errorf("%w: blob %q has a negative size", blob.ErrCorrupt, reference.Key)
+	}
+	return path, nil
+}
+
 func (store *Store) keyForPath(path string) (string, bool) {
 	relative, err := filepath.Rel(filepath.Join(store.root, algorithmDirectory), path)
 	if err != nil {
@@ -268,4 +308,110 @@ func copyWithContext(ctx context.Context, destination io.Writer, source io.Reade
 			return total, readError
 		}
 	}
+}
+
+type verifyingReader struct {
+	ctx               context.Context
+	file              *os.File
+	reference         blob.Ref
+	digest            hash.Hash
+	size              int64
+	complete          bool
+	closed            bool
+	verificationError error
+}
+
+func newVerifyingReader(ctx context.Context, file *os.File, reference blob.Ref) *verifyingReader {
+	return &verifyingReader{
+		ctx:       ctx,
+		file:      file,
+		reference: reference,
+		digest:    sha256.New(),
+	}
+}
+
+func (reader *verifyingReader) Read(buffer []byte) (int, error) {
+	if reader.closed {
+		return 0, os.ErrClosed
+	}
+	if reader.complete {
+		if reader.verificationError != nil {
+			return 0, reader.verificationError
+		}
+		return 0, io.EOF
+	}
+	if err := reader.ctx.Err(); err != nil {
+		return 0, fmt.Errorf("read local blob %q: %w", reader.reference.Key, err)
+	}
+
+	read, readError := reader.file.Read(buffer)
+	if read > 0 {
+		_, _ = reader.digest.Write(buffer[:read])
+		reader.size += int64(read)
+	}
+	if errors.Is(readError, io.EOF) {
+		reader.complete = true
+		reader.verificationError = reader.verify()
+		if reader.verificationError != nil {
+			return read, reader.verificationError
+		}
+	}
+	if readError != nil && !errors.Is(readError, io.EOF) {
+		return read, fmt.Errorf("read local blob %q: %w", reader.reference.Key, readError)
+	}
+	return read, readError
+}
+
+func (reader *verifyingReader) Close() error {
+	if reader.closed {
+		return nil
+	}
+	var verificationError error
+	if reader.complete {
+		verificationError = reader.verificationError
+	} else {
+		_, verificationError = io.Copy(io.Discard, reader)
+	}
+	reader.closed = true
+	return errors.Join(verificationError, reader.file.Close())
+}
+
+func (reader *verifyingReader) verify() error {
+	if reader.size != reader.reference.Size {
+		return fmt.Errorf(
+			"%w: blob %q has size %d, expected %d",
+			blob.ErrCorrupt,
+			reader.reference.Key,
+			reader.size,
+			reader.reference.Size,
+		)
+	}
+	actualHash := hex.EncodeToString(reader.digest.Sum(nil))
+	if actualHash != reader.reference.SHA256 {
+		return fmt.Errorf(
+			"%w: blob %q has SHA-256 %q, expected %q",
+			blob.ErrCorrupt,
+			reader.reference.Key,
+			actualHash,
+			reader.reference.SHA256,
+		)
+	}
+	return nil
+}
+
+func verifyFile(ctx context.Context, path string, reference blob.Ref) error {
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return blob.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	reader := newVerifyingReader(ctx, file, reference)
+	_, readError := io.Copy(io.Discard, reader)
+	closeError := reader.Close()
+	if readError != nil {
+		return readError
+	}
+	return closeError
 }
