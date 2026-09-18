@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 const (
@@ -15,6 +16,8 @@ const (
 	SMTPTLSKeyEnvironment         = EnvironmentPrefix + "SMTP_TLS_KEY_FILE"
 	DatabasePathEnvironment       = EnvironmentPrefix + "DATABASE_PATH"
 	StorageBlobPathEnvironment    = EnvironmentPrefix + "STORAGE_BLOB_PATH"
+	StorageGCIntervalEnvironment  = EnvironmentPrefix + "STORAGE_GC_INTERVAL"
+	StorageGCGraceEnvironment     = EnvironmentPrefix + "STORAGE_GC_GRACE_PERIOD"
 
 	SMTPModePlain    = "plain"
 	SMTPModeStartTLS = "starttls"
@@ -50,7 +53,13 @@ type DatabaseConfig struct {
 }
 
 type StorageConfig struct {
-	BlobPath string `toml:"blob_path"`
+	BlobPath string          `toml:"blob_path"`
+	GC       StorageGCConfig `toml:"gc"`
+}
+
+type StorageGCConfig struct {
+	Interval    string `toml:"interval"`
+	GracePeriod string `toml:"grace_period"`
 }
 
 func Defaults() Config {
@@ -64,6 +73,10 @@ func Defaults() Config {
 		},
 		Storage: StorageConfig{
 			BlobPath: "meilirize-data/blobs",
+			GC: StorageGCConfig{
+				Interval:    "24h",
+				GracePeriod: "24h",
+			},
 		},
 	}
 }
@@ -81,6 +94,9 @@ func (configuration Config) Validate() error {
 	}
 	if strings.TrimSpace(configuration.Storage.BlobPath) == "" {
 		return fmt.Errorf("storage.blob_path must not be empty")
+	}
+	if _, _, err := configuration.Storage.GarbageCollectionDurations(); err != nil {
+		return err
 	}
 
 	listeners, err := configuration.SMTP.ResolvedListeners()
@@ -101,6 +117,24 @@ func (configuration Config) Validate() error {
 		break
 	}
 	return nil
+}
+
+func (configuration StorageConfig) GarbageCollectionDurations() (time.Duration, time.Duration, error) {
+	interval, err := time.ParseDuration(strings.TrimSpace(configuration.GC.Interval))
+	if err != nil {
+		return 0, 0, fmt.Errorf("storage.gc.interval must be a duration: %w", err)
+	}
+	if interval <= 0 {
+		return 0, 0, fmt.Errorf("storage.gc.interval must be positive")
+	}
+	gracePeriod, err := time.ParseDuration(strings.TrimSpace(configuration.GC.GracePeriod))
+	if err != nil {
+		return 0, 0, fmt.Errorf("storage.gc.grace_period must be a duration: %w", err)
+	}
+	if gracePeriod < 0 {
+		return 0, 0, fmt.Errorf("storage.gc.grace_period must not be negative")
+	}
+	return interval, gracePeriod, nil
 }
 
 func (configuration SMTPConfig) ResolvedListeners() ([]SMTPListenerConfig, error) {

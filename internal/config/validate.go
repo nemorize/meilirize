@@ -56,6 +56,12 @@ func load(sources Sources, lookupEnvironment func(string) (string, bool)) (Confi
 		if value, ok := lookupEnvironment(StorageBlobPathEnvironment); ok {
 			configuration.Storage.BlobPath = value
 		}
+		if value, ok := lookupEnvironment(StorageGCIntervalEnvironment); ok {
+			configuration.Storage.GC.Interval = value
+		}
+		if value, ok := lookupEnvironment(StorageGCGraceEnvironment); ok {
+			configuration.Storage.GC.GracePeriod = value
+		}
 	}
 
 	if err := configuration.Validate(); err != nil {

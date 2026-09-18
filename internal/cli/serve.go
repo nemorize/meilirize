@@ -3,7 +3,6 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -13,11 +12,6 @@ import (
 	"meilirize/internal/mailbox"
 	"meilirize/internal/smtpd"
 	"meilirize/internal/storage/sqlite"
-)
-
-const (
-	blobGarbageCollectionInterval = 24 * time.Hour
-	blobGarbageCollectionGrace    = 24 * time.Hour
 )
 
 func newServeCommand(configPath *string, newResolver configResolverFactory) *cobra.Command {
@@ -35,6 +29,10 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 			if err != nil {
 				return err
 			}
+			gcInterval, gcGracePeriod, err := configuration.Storage.GarbageCollectionDurations()
+			if err != nil {
+				return err
+			}
 			store, err := sqlite.Open(command.Context(), configuration.Database.Path)
 			if err != nil {
 				return err
@@ -49,7 +47,7 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 			mailboxService := mailbox.NewService(store, blobStore)
 			if _, err := mailboxService.CollectGarbage(
 				command.Context(),
-				blobGarbageCollectionGrace,
+				gcGracePeriod,
 			); err != nil {
 				return err
 			}
@@ -99,8 +97,8 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 			group.Go(func() error {
 				return mailboxService.RunGarbageCollection(
 					groupContext,
-					blobGarbageCollectionInterval,
-					blobGarbageCollectionGrace,
+					gcInterval,
+					gcGracePeriod,
 				)
 			})
 			return group.Wait()

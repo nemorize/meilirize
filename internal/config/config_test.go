@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadUsesDefaultsWithoutOtherSources(t *testing.T) {
@@ -78,6 +79,10 @@ path = "file.db"
 
 [storage]
 blob_path = "file-blobs"
+
+[storage.gc]
+interval = "12h"
+grace_period = "6h"
 `)
 	sources := newSources(path, FileSelectedByFlag)
 	environment := map[string]string{
@@ -89,6 +94,8 @@ blob_path = "file-blobs"
 		SMTPTLSKeyEnvironment:         "env-key.pem",
 		DatabasePathEnvironment:       "env.db",
 		StorageBlobPathEnvironment:    "env-blobs",
+		StorageGCIntervalEnvironment:  "8h",
+		StorageGCGraceEnvironment:     "4h",
 	}
 
 	configuration, err := load(sources, func(name string) (string, bool) {
@@ -121,6 +128,13 @@ blob_path = "file-blobs"
 	}
 	if configuration.Storage.BlobPath != "env-blobs" {
 		t.Fatalf("storage blob path = %q", configuration.Storage.BlobPath)
+	}
+	gcInterval, gcGracePeriod, err := configuration.Storage.GarbageCollectionDurations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gcInterval != 8*time.Hour || gcGracePeriod != 4*time.Hour {
+		t.Fatalf("storage GC durations = %s, %s", gcInterval, gcGracePeriod)
 	}
 }
 
@@ -162,7 +176,7 @@ func TestLoadRejectsUnknownFileSettings(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsInvalidSMTPSettings(t *testing.T) {
+func TestLoadRejectsInvalidSettings(t *testing.T) {
 	for name, environment := range map[string]map[string]string{
 		"plain listen": {
 			SMTPListenPlainEnvironment: "2525",
@@ -178,6 +192,18 @@ func TestLoadRejectsInvalidSMTPSettings(t *testing.T) {
 		},
 		"storage blob path": {
 			StorageBlobPathEnvironment: "",
+		},
+		"empty GC interval": {
+			StorageGCIntervalEnvironment: "",
+		},
+		"invalid GC interval": {
+			StorageGCIntervalEnvironment: "daily",
+		},
+		"zero GC interval": {
+			StorageGCIntervalEnvironment: "0s",
+		},
+		"negative GC grace period": {
+			StorageGCGraceEnvironment: "-1h",
 		},
 		"STARTTLS listen": {
 			SMTPListenStartTLSEnvironment: "2587",
