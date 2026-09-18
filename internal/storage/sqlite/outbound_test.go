@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,10 +142,15 @@ func TestQueueAndCompleteSubmissionStoresOneMessageInSent(t *testing.T) {
 	if string(storedRaw) != raw {
 		t.Fatalf("stored submission changed:\n%s", storedRaw)
 	}
+	claimed := claimOutboundDeliveries(t, ctx, store, "example", 1)
+	if len(claimed) != 1 || claimed[0].Delivery.ID != queued.Delivery.ID {
+		t.Fatalf("unexpected claimed submissions: %#v", claimed)
+	}
 
 	sentAt := time.Date(2026, 9, 19, 4, 0, 0, 0, time.UTC)
 	completed, err := service.CompleteSubmission(ctx, mailbox.CompleteOutboundDeliveryParams{
 		DeliveryID:        queued.Delivery.ID,
+		LeaseToken:        claimed[0].Delivery.LeaseToken,
 		ProviderMessageID: "provider-message-1",
 		SentAt:            sentAt,
 	})
@@ -168,6 +174,7 @@ func TestQueueAndCompleteSubmissionStoresOneMessageInSent(t *testing.T) {
 
 	again, err := service.CompleteSubmission(ctx, mailbox.CompleteOutboundDeliveryParams{
 		DeliveryID:        queued.Delivery.ID,
+		LeaseToken:        claimed[0].Delivery.LeaseToken,
 		ProviderMessageID: "provider-message-1",
 		SentAt:            sentAt,
 	})
@@ -203,9 +210,18 @@ func TestCompleteSubmissionRollsBackSentUIDOnProviderIDConflict(t *testing.T) {
 	}
 	first := queue("first")
 	second := queue("second")
+	claimed := claimOutboundDeliveries(t, ctx, store, "example", 2)
+	if len(claimed) != 2 {
+		t.Fatalf("claimed submissions = %d", len(claimed))
+	}
+	leaseTokens := map[int64]string{}
+	for _, submission := range claimed {
+		leaseTokens[submission.Delivery.ID] = submission.Delivery.LeaseToken
+	}
 	sentAt := time.Now().UTC()
 	if _, err := service.CompleteSubmission(ctx, mailbox.CompleteOutboundDeliveryParams{
 		DeliveryID:        first.Delivery.ID,
+		LeaseToken:        leaseTokens[first.Delivery.ID],
 		ProviderMessageID: "duplicate-provider-id",
 		SentAt:            sentAt,
 	}); err != nil {
@@ -213,6 +229,7 @@ func TestCompleteSubmissionRollsBackSentUIDOnProviderIDConflict(t *testing.T) {
 	}
 	if _, err := service.CompleteSubmission(ctx, mailbox.CompleteOutboundDeliveryParams{
 		DeliveryID:        second.Delivery.ID,
+		LeaseToken:        leaseTokens[second.Delivery.ID],
 		ProviderMessageID: "duplicate-provider-id",
 		SentAt:            sentAt,
 	}); !errors.Is(err, mailbox.ErrConflict) {
@@ -235,8 +252,187 @@ func TestCompleteSubmissionRollsBackSentUIDOnProviderIDConflict(t *testing.T) {
 	).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status != mailbox.OutboundDeliveryQueued {
+	if status != mailbox.OutboundDeliverySending {
 		t.Fatalf("second delivery status after rollback = %q", status)
+	}
+}
+
+func TestOutboundLeaseClaimRetryRecoveryAndFailure(t *testing.T) {
+	ctx := context.Background()
+	store, service, binding, _ := newOutboundTestService(t, ctx)
+	queued, err := service.QueueSubmission(ctx, mailbox.QueueSubmissionParams{
+		ProviderBindingID:  binding.ID,
+		EnvelopeFrom:       "sender@example.com",
+		EnvelopeRecipients: []string{"recipient@example.net"},
+	}, strings.NewReader("From: sender@example.com\r\n\r\nbody"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 19, 6, 0, 0, 0, time.UTC)
+	claim := func(providerName string, token string, at time.Time) []mailbox.ClaimedSubmission {
+		t.Helper()
+		claimed, err := store.ClaimOutboundDeliveries(ctx, mailbox.ClaimOutboundDeliveriesParams{
+			Providers:      []string{providerName},
+			Limit:          1,
+			LeaseToken:     token,
+			Now:            at,
+			LeaseExpiresAt: at.Add(time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return claimed
+	}
+
+	if claimed := claim("unsupported", strings.Repeat("f", 64), now); len(claimed) != 0 {
+		t.Fatalf("unsupported provider claim = %#v", claimed)
+	}
+	if _, err := store.database.ExecContext(
+		ctx,
+		"UPDATE provider_bindings SET send_enabled = 0, receive_enabled = 1 WHERE id = ?",
+		binding.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if claimed := claim("example", strings.Repeat("f", 64), now); len(claimed) != 0 {
+		t.Fatalf("disabled provider claim = %#v", claimed)
+	}
+	if _, err := store.database.ExecContext(
+		ctx,
+		"UPDATE provider_bindings SET send_enabled = 1 WHERE id = ?",
+		binding.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	firstToken := strings.Repeat("a", 64)
+	first := claim("example", firstToken, now)
+	if len(first) != 1 ||
+		first[0].Delivery.ID != queued.Delivery.ID ||
+		first[0].Delivery.Status != mailbox.OutboundDeliverySending ||
+		first[0].Delivery.AttemptCount != 1 ||
+		first[0].Delivery.LeaseToken != firstToken {
+		t.Fatalf("first claim = %#v", first)
+	}
+	if claimed := claim("example", strings.Repeat("b", 64), now.Add(30*time.Second)); len(claimed) != 0 {
+		t.Fatalf("claim before lease expiration = %#v", claimed)
+	}
+
+	secondToken := strings.Repeat("c", 64)
+	second := claim("example", secondToken, now.Add(2*time.Minute))
+	if len(second) != 1 || second[0].Delivery.AttemptCount != 2 ||
+		second[0].Delivery.LeaseToken != secondToken {
+		t.Fatalf("recovered claim = %#v", second)
+	}
+	if err := store.RetryOutboundDelivery(ctx, mailbox.RetryOutboundDeliveryParams{
+		DeliveryID:    queued.Delivery.ID,
+		LeaseToken:    firstToken,
+		LastError:     "stale worker",
+		NextAttemptAt: now.Add(4 * time.Minute),
+		UpdatedAt:     now.Add(3 * time.Minute),
+	}); !errors.Is(err, mailbox.ErrLeaseLost) {
+		t.Fatalf("stale retry error = %v", err)
+	}
+	nextAttempt := now.Add(4 * time.Minute)
+	if err := store.RetryOutboundDelivery(ctx, mailbox.RetryOutboundDeliveryParams{
+		DeliveryID:    queued.Delivery.ID,
+		LeaseToken:    secondToken,
+		LastError:     "temporary failure",
+		NextAttemptAt: nextAttempt,
+		UpdatedAt:     now.Add(3 * time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if claimed := claim("example", strings.Repeat("d", 64), nextAttempt.Add(-time.Second)); len(claimed) != 0 {
+		t.Fatalf("claim before retry time = %#v", claimed)
+	}
+
+	thirdToken := strings.Repeat("e", 64)
+	third := claim("example", thirdToken, nextAttempt)
+	if len(third) != 1 || third[0].Delivery.AttemptCount != 3 {
+		t.Fatalf("retry claim = %#v", third)
+	}
+	if err := store.FailOutboundDelivery(ctx, mailbox.FailOutboundDeliveryParams{
+		DeliveryID: queued.Delivery.ID,
+		LeaseToken: thirdToken,
+		LastError:  "permanent failure",
+		UpdatedAt:  nextAttempt.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var status mailbox.OutboundDeliveryStatus
+	var attempts int
+	var lastError string
+	var leaseToken string
+	var leaseExpiresAt any
+	if err := store.database.QueryRowContext(
+		ctx,
+		`SELECT status, attempt_count, last_error, lease_token, lease_expires_at
+         FROM outbound_deliveries WHERE id = ?`,
+		queued.Delivery.ID,
+	).Scan(&status, &attempts, &lastError, &leaseToken, &leaseExpiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != mailbox.OutboundDeliveryFailed || attempts != 3 ||
+		lastError != "permanent failure" || leaseToken != "" || leaseExpiresAt != nil {
+		t.Fatalf(
+			"failed delivery = status %q, attempts %d, error %q, token %q, expiration %#v",
+			status,
+			attempts,
+			lastError,
+			leaseToken,
+			leaseExpiresAt,
+		)
+	}
+}
+
+func TestOutboundClaimIsAtomicAcrossWorkers(t *testing.T) {
+	ctx := context.Background()
+	store, service, binding, _ := newOutboundTestService(t, ctx)
+	if _, err := service.QueueSubmission(ctx, mailbox.QueueSubmissionParams{
+		ProviderBindingID:  binding.ID,
+		EnvelopeFrom:       "sender@example.com",
+		EnvelopeRecipients: []string{"recipient@example.net"},
+	}, strings.NewReader("From: sender@example.com\r\n\r\nbody")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 19, 7, 0, 0, 0, time.UTC)
+	start := make(chan struct{})
+	results := make(chan []mailbox.ClaimedSubmission, 2)
+	errorsByWorker := make(chan error, 2)
+	var group sync.WaitGroup
+	for _, tokenCharacter := range []string{"a", "b"} {
+		tokenCharacter := tokenCharacter
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			claimed, err := store.ClaimOutboundDeliveries(ctx, mailbox.ClaimOutboundDeliveriesParams{
+				Providers:      []string{"example"},
+				Limit:          1,
+				LeaseToken:     strings.Repeat(tokenCharacter, 64),
+				Now:            now,
+				LeaseExpiresAt: now.Add(time.Minute),
+			})
+			if err != nil {
+				errorsByWorker <- err
+				return
+			}
+			results <- claimed
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	close(errorsByWorker)
+	for err := range errorsByWorker {
+		t.Fatal(err)
+	}
+	claimedCount := 0
+	for claimed := range results {
+		claimedCount += len(claimed)
+	}
+	if claimedCount != 1 {
+		t.Fatalf("claimed deliveries = %d, want 1", claimedCount)
 	}
 }
 
@@ -367,4 +563,26 @@ func newOutboundTestService(
 		t.Fatal(err)
 	}
 	return store, mailbox.NewService(store, blobStore), binding, sentMailbox
+}
+
+func claimOutboundDeliveries(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+	providerName string,
+	limit int,
+) []mailbox.ClaimedSubmission {
+	t.Helper()
+	now := time.Date(2026, 9, 19, 3, 0, 0, 0, time.UTC)
+	claimed, err := store.ClaimOutboundDeliveries(ctx, mailbox.ClaimOutboundDeliveriesParams{
+		Providers:      []string{providerName},
+		Limit:          limit,
+		LeaseToken:     strings.Repeat("a", 64),
+		Now:            now,
+		LeaseExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claimed
 }

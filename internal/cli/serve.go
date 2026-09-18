@@ -10,6 +10,8 @@ import (
 	bloblocal "meilirize/internal/blob/local"
 	"meilirize/internal/config"
 	"meilirize/internal/mailbox"
+	"meilirize/internal/outbound"
+	"meilirize/internal/provider"
 	"meilirize/internal/smtpd"
 	"meilirize/internal/storage/sqlite"
 )
@@ -33,6 +35,10 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 			if err != nil {
 				return err
 			}
+			deliveryConfiguration, err := configuration.Delivery.Runtime()
+			if err != nil {
+				return err
+			}
 			store, err := sqlite.Open(command.Context(), configuration.Database.Path)
 			if err != nil {
 				return err
@@ -45,6 +51,19 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 				return err
 			}
 			mailboxService := mailbox.NewService(store, blobStore)
+			providerRegistry := provider.NewRegistry()
+			deliveryWorker, err := outbound.New(outbound.Config{
+				PollInterval:  deliveryConfiguration.PollInterval,
+				LeaseDuration: deliveryConfiguration.LeaseDuration,
+				SendTimeout:   deliveryConfiguration.SendTimeout,
+				BatchSize:     deliveryConfiguration.BatchSize,
+				MaxAttempts:   deliveryConfiguration.MaxAttempts,
+				RetryInitial:  deliveryConfiguration.RetryInitial,
+				RetryMax:      deliveryConfiguration.RetryMax,
+			}, store, mailboxService, providerRegistry)
+			if err != nil {
+				return err
+			}
 			if _, err := mailboxService.CollectGarbage(
 				command.Context(),
 				gcGracePeriod,
@@ -100,6 +119,9 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 					gcInterval,
 					gcGracePeriod,
 				)
+			})
+			group.Go(func() error {
+				return deliveryWorker.Run(groupContext)
 			})
 			return group.Wait()
 		},

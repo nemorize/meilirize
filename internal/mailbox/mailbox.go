@@ -10,9 +10,10 @@ import (
 )
 
 var (
-	ErrConflict = errors.New("mailbox record conflicts with existing data")
-	ErrInvalid  = errors.New("invalid mailbox data")
-	ErrNotFound = errors.New("mailbox record not found")
+	ErrConflict  = errors.New("mailbox record conflicts with existing data")
+	ErrInvalid   = errors.New("invalid mailbox data")
+	ErrLeaseLost = errors.New("outbound delivery lease was lost")
+	ErrNotFound  = errors.New("mailbox record not found")
 )
 
 type User struct {

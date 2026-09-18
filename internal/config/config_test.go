@@ -83,19 +83,35 @@ blob_path = "file-blobs"
 [storage.gc]
 interval = "12h"
 grace_period = "6h"
+
+[delivery]
+poll_interval = "2s"
+lease_duration = "2m"
+send_timeout = "45s"
+batch_size = 4
+max_attempts = 6
+retry_initial = "10s"
+retry_max = "20m"
 `)
 	sources := newSources(path, FileSelectedByFlag)
 	environment := map[string]string{
-		SMTPListenPlainEnvironment:    "127.0.0.1:2600",
-		SMTPListenStartTLSEnvironment: "127.0.0.1:2680",
-		SMTPListenImplicitEnvironment: "127.0.0.1:2468",
-		SMTPHostnameEnvironment:       "env.example",
-		SMTPTLSCertEnvironment:        "env-cert.pem",
-		SMTPTLSKeyEnvironment:         "env-key.pem",
-		DatabasePathEnvironment:       "env.db",
-		StorageBlobPathEnvironment:    "env-blobs",
-		StorageGCIntervalEnvironment:  "8h",
-		StorageGCGraceEnvironment:     "4h",
+		SMTPListenPlainEnvironment:      "127.0.0.1:2600",
+		SMTPListenStartTLSEnvironment:   "127.0.0.1:2680",
+		SMTPListenImplicitEnvironment:   "127.0.0.1:2468",
+		SMTPHostnameEnvironment:         "env.example",
+		SMTPTLSCertEnvironment:          "env-cert.pem",
+		SMTPTLSKeyEnvironment:           "env-key.pem",
+		DatabasePathEnvironment:         "env.db",
+		StorageBlobPathEnvironment:      "env-blobs",
+		StorageGCIntervalEnvironment:    "8h",
+		StorageGCGraceEnvironment:       "4h",
+		DeliveryPollEnvironment:         "3s",
+		DeliveryLeaseEnvironment:        "3m",
+		DeliverySendTimeoutEnvironment:  "1m",
+		DeliveryBatchSizeEnvironment:    "12",
+		DeliveryMaxAttemptsEnvironment:  "7",
+		DeliveryRetryInitialEnvironment: "15s",
+		DeliveryRetryMaxEnvironment:     "30m",
 	}
 
 	configuration, err := load(sources, func(name string) (string, bool) {
@@ -135,6 +151,19 @@ grace_period = "6h"
 	}
 	if gcInterval != 8*time.Hour || gcGracePeriod != 4*time.Hour {
 		t.Fatalf("storage GC durations = %s, %s", gcInterval, gcGracePeriod)
+	}
+	delivery, err := configuration.Delivery.Runtime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery.PollInterval != 3*time.Second ||
+		delivery.LeaseDuration != 3*time.Minute ||
+		delivery.SendTimeout != time.Minute ||
+		delivery.BatchSize != 12 ||
+		delivery.MaxAttempts != 7 ||
+		delivery.RetryInitial != 15*time.Second ||
+		delivery.RetryMax != 30*time.Minute {
+		t.Fatalf("delivery configuration = %#v", delivery)
 	}
 }
 
@@ -204,6 +233,23 @@ func TestLoadRejectsInvalidSettings(t *testing.T) {
 		},
 		"negative GC grace period": {
 			StorageGCGraceEnvironment: "-1h",
+		},
+		"invalid delivery poll interval": {
+			DeliveryPollEnvironment: "often",
+		},
+		"delivery timeout exceeds lease": {
+			DeliveryLeaseEnvironment:       "30s",
+			DeliverySendTimeoutEnvironment: "30s",
+		},
+		"invalid delivery batch size": {
+			DeliveryBatchSizeEnvironment: "many",
+		},
+		"zero delivery attempts": {
+			DeliveryMaxAttemptsEnvironment: "0",
+		},
+		"delivery retry range": {
+			DeliveryRetryInitialEnvironment: "2m",
+			DeliveryRetryMaxEnvironment:     "1m",
 		},
 		"STARTTLS listen": {
 			SMTPListenStartTLSEnvironment: "2587",

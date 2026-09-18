@@ -30,7 +30,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 	assertPragma(t, store.database, "busy_timeout", "5000")
 	assertPragma(t, store.database, "journal_mode", "wal")
 	assertPragma(t, store.database, "synchronous", "1")
-	assertMigrationCount(t, store.database, 7)
+	assertMigrationCount(t, store.database, 8)
 
 	var name string
 	if err := store.database.QueryRowContext(
@@ -59,7 +59,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	assertMigrationCount(t, reopened.database, 7)
+	assertMigrationCount(t, reopened.database, 8)
 }
 
 func TestRecreatedInboxReceivesNewUIDValidity(t *testing.T) {

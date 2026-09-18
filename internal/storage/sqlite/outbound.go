@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"meilirize/internal/mailbox"
 )
@@ -78,12 +79,213 @@ func (store *Store) CreateOutboundDelivery(
 	return mailbox.QueuedSubmission{Message: message, Delivery: delivery}, nil
 }
 
+func (store *Store) ClaimOutboundDeliveries(
+	ctx context.Context,
+	params mailbox.ClaimOutboundDeliveriesParams,
+) ([]mailbox.ClaimedSubmission, error) {
+	providers, err := validateOutboundClaimParams(params)
+	if err != nil {
+		return nil, err
+	}
+	if len(providers) == 0 {
+		return []mailbox.ClaimedSubmission{}, nil
+	}
+
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin outbound claim transaction: %w", err)
+	}
+	defer transaction.Rollback()
+
+	providerPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(providers)), ",")
+	query := fmt.Sprintf(
+		`UPDATE outbound_deliveries
+         SET status = 'sending',
+             attempt_count = attempt_count + 1,
+             next_attempt_at = NULL,
+             lease_token = ?,
+             lease_expires_at = ?,
+             updated_at = ?
+         WHERE id IN (
+             SELECT outbound_deliveries.id
+             FROM outbound_deliveries
+             JOIN provider_bindings
+               ON provider_bindings.id = outbound_deliveries.provider_binding_id
+             JOIN addresses
+               ON addresses.id = provider_bindings.address_id
+             JOIN messages
+               ON messages.id = outbound_deliveries.message_id
+             WHERE provider_bindings.provider IN (%s)
+               AND provider_bindings.send_enabled = 1
+               AND addresses.address = messages.envelope_from
+               AND (
+                   outbound_deliveries.status = 'queued'
+                   OR (
+                       outbound_deliveries.status = 'retry'
+                       AND (
+                           outbound_deliveries.next_attempt_at IS NULL
+                           OR julianday(outbound_deliveries.next_attempt_at) <= julianday(?)
+                       )
+                   )
+                   OR (
+                       outbound_deliveries.status = 'sending'
+                       AND julianday(outbound_deliveries.lease_expires_at) <= julianday(?)
+                   )
+               )
+             ORDER BY CASE outbound_deliveries.status
+                 WHEN 'queued' THEN julianday(outbound_deliveries.submitted_at)
+                 WHEN 'retry' THEN julianday(COALESCE(
+                     outbound_deliveries.next_attempt_at,
+                     outbound_deliveries.submitted_at
+                 ))
+                 ELSE julianday(outbound_deliveries.lease_expires_at)
+             END,
+             outbound_deliveries.id
+             LIMIT ?
+         )
+         RETURNING id`,
+		providerPlaceholders,
+	)
+	arguments := []any{
+		params.LeaseToken,
+		formatTimestamp(params.LeaseExpiresAt),
+		formatTimestamp(params.Now),
+	}
+	for _, providerName := range providers {
+		arguments = append(arguments, providerName)
+	}
+	arguments = append(
+		arguments,
+		formatTimestamp(params.Now),
+		formatTimestamp(params.Now),
+		params.Limit,
+	)
+	rows, err := transaction.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("claim outbound deliveries: %w", err)
+	}
+	var deliveryIDs []int64
+	for rows.Next() {
+		var deliveryID int64
+		if err := rows.Scan(&deliveryID); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan claimed outbound delivery ID: %w", err)
+		}
+		deliveryIDs = append(deliveryIDs, deliveryID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterate claimed outbound delivery IDs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close claimed outbound delivery IDs: %w", err)
+	}
+
+	claimed := make([]mailbox.ClaimedSubmission, 0, len(deliveryIDs))
+	for _, deliveryID := range deliveryIDs {
+		delivery, err := outboundDeliveryByID(ctx, transaction, deliveryID)
+		if err != nil {
+			return nil, err
+		}
+		message, err := messageByID(ctx, transaction, delivery.MessageID)
+		if err != nil {
+			return nil, err
+		}
+		binding, err := providerBindingByID(ctx, transaction, delivery.ProviderBindingID)
+		if err != nil {
+			return nil, err
+		}
+		claimed = append(claimed, mailbox.ClaimedSubmission{
+			Message:         message,
+			Delivery:        delivery,
+			ProviderBinding: binding,
+		})
+	}
+	if err := transaction.Commit(); err != nil {
+		return nil, fmt.Errorf("commit outbound claim transaction: %w", err)
+	}
+	return claimed, nil
+}
+
+func (store *Store) RetryOutboundDelivery(
+	ctx context.Context,
+	params mailbox.RetryOutboundDeliveryParams,
+) error {
+	if err := validateOutboundTransition(
+		params.DeliveryID,
+		params.LeaseToken,
+		params.LastError,
+		params.UpdatedAt,
+	); err != nil {
+		return err
+	}
+	if params.NextAttemptAt.IsZero() || !params.NextAttemptAt.After(params.UpdatedAt) {
+		return fmt.Errorf("%w: next attempt time must be after update time", mailbox.ErrInvalid)
+	}
+	result, err := store.database.ExecContext(
+		ctx,
+		`UPDATE outbound_deliveries
+         SET status = 'retry',
+             last_error = ?,
+             next_attempt_at = ?,
+             lease_token = '',
+             lease_expires_at = NULL,
+             updated_at = ?
+         WHERE id = ? AND status = 'sending' AND lease_token = ?`,
+		params.LastError,
+		formatTimestamp(params.NextAttemptAt),
+		formatTimestamp(params.UpdatedAt),
+		params.DeliveryID,
+		params.LeaseToken,
+	)
+	if err != nil {
+		return mapWriteError("retry outbound delivery", err)
+	}
+	return requireOutboundLease(result, "retry outbound delivery")
+}
+
+func (store *Store) FailOutboundDelivery(
+	ctx context.Context,
+	params mailbox.FailOutboundDeliveryParams,
+) error {
+	if err := validateOutboundTransition(
+		params.DeliveryID,
+		params.LeaseToken,
+		params.LastError,
+		params.UpdatedAt,
+	); err != nil {
+		return err
+	}
+	result, err := store.database.ExecContext(
+		ctx,
+		`UPDATE outbound_deliveries
+         SET status = 'failed',
+             last_error = ?,
+             next_attempt_at = NULL,
+             lease_token = '',
+             lease_expires_at = NULL,
+             updated_at = ?
+         WHERE id = ? AND status = 'sending' AND lease_token = ?`,
+		params.LastError,
+		formatTimestamp(params.UpdatedAt),
+		params.DeliveryID,
+		params.LeaseToken,
+	)
+	if err != nil {
+		return mapWriteError("fail outbound delivery", err)
+	}
+	return requireOutboundLease(result, "fail outbound delivery")
+}
+
 func (store *Store) CompleteOutboundDelivery(
 	ctx context.Context,
 	params mailbox.CompleteOutboundDeliveryParams,
 ) (mailbox.SentSubmission, error) {
 	if params.DeliveryID <= 0 {
 		return mailbox.SentSubmission{}, fmt.Errorf("%w: outbound delivery ID must be positive", mailbox.ErrInvalid)
+	}
+	if err := validateOutboundToken(params.LeaseToken, "lease token"); err != nil {
+		return mailbox.SentSubmission{}, err
 	}
 	providerMessageID := strings.TrimSpace(params.ProviderMessageID)
 	if providerMessageID == "" {
@@ -122,6 +324,12 @@ func (store *Store) CompleteOutboundDelivery(
 			mailbox.ErrConflict,
 		)
 	}
+	if delivery.Status != mailbox.OutboundDeliverySending || delivery.LeaseToken != params.LeaseToken {
+		return mailbox.SentSubmission{}, fmt.Errorf(
+			"complete outbound delivery: %w",
+			mailbox.ErrLeaseLost,
+		)
+	}
 
 	uid, err := allocateUID(ctx, transaction, sentMailbox.ID)
 	if err != nil {
@@ -138,22 +346,28 @@ func (store *Store) CompleteOutboundDelivery(
 	); err != nil {
 		return mailbox.SentSubmission{}, err
 	}
-	if _, err := transaction.ExecContext(
+	result, err := transaction.ExecContext(
 		ctx,
 		`UPDATE outbound_deliveries
          SET status = 'sent',
-             attempt_count = attempt_count + 1,
              provider_message_id = ?,
              last_error = '',
              next_attempt_at = NULL,
+             lease_token = '',
+             lease_expires_at = NULL,
              sent_at = ?,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?`,
+         WHERE id = ? AND status = 'sending' AND lease_token = ?`,
 		providerMessageID,
 		formatTimestamp(params.SentAt),
 		delivery.ID,
-	); err != nil {
+		params.LeaseToken,
+	)
+	if err != nil {
 		return mailbox.SentSubmission{}, mapWriteError("complete outbound delivery", err)
+	}
+	if err := requireOutboundLease(result, "complete outbound delivery"); err != nil {
+		return mailbox.SentSubmission{}, err
 	}
 	delivery, err = outboundDeliveryByID(ctx, transaction, delivery.ID)
 	if err != nil {
@@ -198,18 +412,87 @@ func validateOutboundDeliveryParams(params mailbox.CreateOutboundDeliveryParams)
 	); err != nil {
 		return err
 	}
-	if len(params.IdempotencyKey) != 64 ||
-		strings.ToLower(params.IdempotencyKey) != params.IdempotencyKey {
-		return fmt.Errorf("%w: outbound idempotency key must be lowercase hexadecimal", mailbox.ErrInvalid)
-	}
-	if _, err := hex.DecodeString(params.IdempotencyKey); err != nil {
-		return fmt.Errorf("%w: outbound idempotency key must be lowercase hexadecimal", mailbox.ErrInvalid)
+	if err := validateOutboundToken(params.IdempotencyKey, "outbound idempotency key"); err != nil {
+		return err
 	}
 	if _, err := mailbox.NormalizeAddress(params.EnvelopeFrom); err != nil {
 		return err
 	}
 	if len(params.EnvelopeRecipients) == 0 {
 		return fmt.Errorf("%w: at least one envelope recipient is required", mailbox.ErrInvalid)
+	}
+	return nil
+}
+
+func validateOutboundClaimParams(
+	params mailbox.ClaimOutboundDeliveriesParams,
+) ([]string, error) {
+	if params.Limit <= 0 || params.Limit > 100 {
+		return nil, fmt.Errorf("%w: outbound claim limit must be between 1 and 100", mailbox.ErrInvalid)
+	}
+	if err := validateOutboundToken(params.LeaseToken, "lease token"); err != nil {
+		return nil, err
+	}
+	if params.Now.IsZero() {
+		return nil, fmt.Errorf("%w: outbound claim time must not be zero", mailbox.ErrInvalid)
+	}
+	if params.LeaseExpiresAt.IsZero() || !params.LeaseExpiresAt.After(params.Now) {
+		return nil, fmt.Errorf("%w: lease expiration must be after claim time", mailbox.ErrInvalid)
+	}
+	providers := make([]string, 0, len(params.Providers))
+	seen := make(map[string]struct{}, len(params.Providers))
+	for _, value := range params.Providers {
+		providerName, err := mailbox.NormalizeProvider(value)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seen[providerName]; exists {
+			continue
+		}
+		seen[providerName] = struct{}{}
+		providers = append(providers, providerName)
+	}
+	return providers, nil
+}
+
+func validateOutboundTransition(
+	deliveryID int64,
+	leaseToken string,
+	lastError string,
+	updatedAt time.Time,
+) error {
+	if deliveryID <= 0 {
+		return fmt.Errorf("%w: outbound delivery ID must be positive", mailbox.ErrInvalid)
+	}
+	if err := validateOutboundToken(leaseToken, "lease token"); err != nil {
+		return err
+	}
+	if strings.TrimSpace(lastError) == "" {
+		return fmt.Errorf("%w: outbound delivery error must not be empty", mailbox.ErrInvalid)
+	}
+	if updatedAt.IsZero() {
+		return fmt.Errorf("%w: outbound delivery update time must not be zero", mailbox.ErrInvalid)
+	}
+	return nil
+}
+
+func validateOutboundToken(value string, name string) error {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return fmt.Errorf("%w: %s must be lowercase hexadecimal", mailbox.ErrInvalid, name)
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return fmt.Errorf("%w: %s must be lowercase hexadecimal", mailbox.ErrInvalid, name)
+	}
+	return nil
+}
+
+func requireOutboundLease(result sql.Result, operation string) error {
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%s: read affected rows: %w", operation, err)
+	}
+	if changed != 1 {
+		return fmt.Errorf("%s: %w", operation, mailbox.ErrLeaseLost)
 	}
 	return nil
 }
@@ -279,8 +562,8 @@ func outboundDeliveryByID(
 	return scanOutboundDelivery(queries.QueryRowContext(
 		ctx,
 		`SELECT id, idempotency_key, message_id, provider_binding_id, status, attempt_count,
-                provider_message_id, last_error, next_attempt_at, submitted_at,
-                sent_at, created_at, updated_at
+                provider_message_id, last_error, next_attempt_at, lease_token,
+                lease_expires_at, submitted_at, sent_at, created_at, updated_at
          FROM outbound_deliveries WHERE id = ?`,
 		id,
 	))
@@ -310,6 +593,7 @@ func sentMailboxForDelivery(
 func scanOutboundDelivery(row rowScanner) (mailbox.OutboundDelivery, error) {
 	var delivery mailbox.OutboundDelivery
 	var nextAttemptAt sql.NullString
+	var leaseExpiresAt sql.NullString
 	var submittedAt string
 	var sentAt sql.NullString
 	var createdAt string
@@ -324,6 +608,8 @@ func scanOutboundDelivery(row rowScanner) (mailbox.OutboundDelivery, error) {
 		&delivery.ProviderMessageID,
 		&delivery.LastError,
 		&nextAttemptAt,
+		&delivery.LeaseToken,
+		&leaseExpiresAt,
 		&submittedAt,
 		&sentAt,
 		&createdAt,
@@ -338,6 +624,12 @@ func scanOutboundDelivery(row rowScanner) (mailbox.OutboundDelivery, error) {
 	}
 	if nextAttemptAt.Valid {
 		delivery.NextAttemptAt, err = parseTimestamp(nextAttemptAt.String)
+		if err != nil {
+			return mailbox.OutboundDelivery{}, err
+		}
+	}
+	if leaseExpiresAt.Valid {
+		delivery.LeaseExpiresAt, err = parseTimestamp(leaseExpiresAt.String)
 		if err != nil {
 			return mailbox.OutboundDelivery{}, err
 		}

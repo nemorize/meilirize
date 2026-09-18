@@ -28,6 +28,8 @@ type OutboundDelivery struct {
 	ProviderMessageID string
 	LastError         string
 	NextAttemptAt     time.Time
+	LeaseToken        string
+	LeaseExpiresAt    time.Time
 	SubmittedAt       time.Time
 	SentAt            time.Time
 	CreatedAt         time.Time
@@ -43,6 +45,12 @@ type SentSubmission struct {
 	Message        Message
 	Delivery       OutboundDelivery
 	MailboxMessage MailboxMessage
+}
+
+type ClaimedSubmission struct {
+	Message         Message
+	Delivery        OutboundDelivery
+	ProviderBinding ProviderBinding
 }
 
 type QueueSubmissionParams struct {
@@ -68,12 +76,39 @@ type CreateOutboundDeliveryParams struct {
 
 type CompleteOutboundDeliveryParams struct {
 	DeliveryID        int64
+	LeaseToken        string
 	ProviderMessageID string
 	SentAt            time.Time
 }
 
+type ClaimOutboundDeliveriesParams struct {
+	Providers      []string
+	Limit          int
+	LeaseToken     string
+	Now            time.Time
+	LeaseExpiresAt time.Time
+}
+
+type RetryOutboundDeliveryParams struct {
+	DeliveryID    int64
+	LeaseToken    string
+	LastError     string
+	NextAttemptAt time.Time
+	UpdatedAt     time.Time
+}
+
+type FailOutboundDeliveryParams struct {
+	DeliveryID int64
+	LeaseToken string
+	LastError  string
+	UpdatedAt  time.Time
+}
+
 type OutboundRepository interface {
 	CreateOutboundDelivery(context.Context, CreateOutboundDeliveryParams) (QueuedSubmission, error)
+	ClaimOutboundDeliveries(context.Context, ClaimOutboundDeliveriesParams) ([]ClaimedSubmission, error)
+	RetryOutboundDelivery(context.Context, RetryOutboundDeliveryParams) error
+	FailOutboundDelivery(context.Context, FailOutboundDeliveryParams) error
 	CompleteOutboundDelivery(context.Context, CompleteOutboundDeliveryParams) (SentSubmission, error)
 }
 
