@@ -106,6 +106,7 @@ type CreateMessageParams struct {
 }
 
 type MessageRepository interface {
+	OutboundRepository
 	MailboxByName(context.Context, int64, string) (Mailbox, error)
 	Message(context.Context, int64) (Message, error)
 	CreateMessage(context.Context, CreateMessageParams) (StoredMessage, error)

@@ -159,7 +159,15 @@ func (store *Store) CreateMessage(
 	if err := insertParticipants(ctx, transaction, messageID, params.Participants); err != nil {
 		return mailbox.StoredMessage{}, err
 	}
-	if err := insertMailboxMessage(ctx, transaction, messageID, uid, params); err != nil {
+	if err := insertMailboxMessage(
+		ctx,
+		transaction,
+		params.MailboxID,
+		messageID,
+		uid,
+		params.Flags,
+		params.InternalDate,
+	); err != nil {
 		return mailbox.StoredMessage{}, err
 	}
 	message, err := messageByID(ctx, transaction, messageID)
@@ -180,26 +188,38 @@ func validateMessageParams(params mailbox.CreateMessageParams) error {
 	if params.MailboxID <= 0 {
 		return fmt.Errorf("%w: mailbox ID must be positive", mailbox.ErrInvalid)
 	}
-	if strings.TrimSpace(params.BlobKey) == "" {
-		return fmt.Errorf("%w: blob key must not be empty", mailbox.ErrInvalid)
-	}
-	if len(params.BlobSHA256) != 64 || strings.ToLower(params.BlobSHA256) != params.BlobSHA256 {
-		return fmt.Errorf("%w: blob SHA-256 must be lowercase hexadecimal", mailbox.ErrInvalid)
-	}
-	if _, err := hex.DecodeString(params.BlobSHA256); err != nil {
-		return fmt.Errorf("%w: blob SHA-256 must be lowercase hexadecimal", mailbox.ErrInvalid)
-	}
-	if params.BlobKey != "sha256/"+params.BlobSHA256 {
-		return fmt.Errorf("%w: blob key must match blob SHA-256", mailbox.ErrInvalid)
-	}
-	if params.RawSize < 0 {
-		return fmt.Errorf("%w: raw message size must not be negative", mailbox.ErrInvalid)
-	}
-	if params.ReceivedAt.IsZero() {
-		return fmt.Errorf("%w: received time must not be zero", mailbox.ErrInvalid)
+	if err := validateMessageRecord(
+		params.BlobKey,
+		params.BlobSHA256,
+		params.RawSize,
+		params.ReceivedAt,
+	); err != nil {
+		return err
 	}
 	if params.InternalDate.IsZero() {
 		return fmt.Errorf("%w: internal date must not be zero", mailbox.ErrInvalid)
+	}
+	return nil
+}
+
+func validateMessageRecord(blobKey, blobSHA256 string, rawSize int64, receivedAt time.Time) error {
+	if strings.TrimSpace(blobKey) == "" {
+		return fmt.Errorf("%w: blob key must not be empty", mailbox.ErrInvalid)
+	}
+	if len(blobSHA256) != 64 || strings.ToLower(blobSHA256) != blobSHA256 {
+		return fmt.Errorf("%w: blob SHA-256 must be lowercase hexadecimal", mailbox.ErrInvalid)
+	}
+	if _, err := hex.DecodeString(blobSHA256); err != nil {
+		return fmt.Errorf("%w: blob SHA-256 must be lowercase hexadecimal", mailbox.ErrInvalid)
+	}
+	if blobKey != "sha256/"+blobSHA256 {
+		return fmt.Errorf("%w: blob key must match blob SHA-256", mailbox.ErrInvalid)
+	}
+	if rawSize < 0 {
+		return fmt.Errorf("%w: raw message size must not be negative", mailbox.ErrInvalid)
+	}
+	if receivedAt.IsZero() {
+		return fmt.Errorf("%w: received time must not be zero", mailbox.ErrInvalid)
 	}
 	return nil
 }
@@ -330,24 +350,26 @@ func insertParticipants(
 func insertMailboxMessage(
 	ctx context.Context,
 	transaction *sql.Tx,
+	mailboxID int64,
 	messageID int64,
 	uid uint32,
-	params mailbox.CreateMessageParams,
+	flags mailbox.MessageFlags,
+	internalDate time.Time,
 ) error {
 	_, err := transaction.ExecContext(
 		ctx,
 		`INSERT INTO mailbox_messages
             (mailbox_id, message_id, uid, seen, answered, flagged, deleted, draft, internal_date)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		params.MailboxID,
+		mailboxID,
 		messageID,
 		uid,
-		params.Flags.Seen,
-		params.Flags.Answered,
-		params.Flags.Flagged,
-		params.Flags.Deleted,
-		params.Flags.Draft,
-		formatTimestamp(params.InternalDate),
+		flags.Seen,
+		flags.Answered,
+		flags.Flagged,
+		flags.Deleted,
+		flags.Draft,
+		formatTimestamp(internalDate),
 	)
 	if err != nil {
 		return mapWriteError("add message to mailbox", err)

@@ -91,6 +91,71 @@ func (service *Service) Ingest(
 	})
 }
 
+func (service *Service) QueueSubmission(
+	ctx context.Context,
+	params QueueSubmissionParams,
+	raw io.Reader,
+) (QueuedSubmission, error) {
+	service.lifecycle.RLock()
+	defer service.lifecycle.RUnlock()
+
+	if params.ProviderBindingID <= 0 {
+		return QueuedSubmission{}, fmt.Errorf("%w: provider binding ID must be positive", ErrInvalid)
+	}
+	envelopeFrom, err := NormalizeAddress(params.EnvelopeFrom)
+	if err != nil {
+		return QueuedSubmission{}, err
+	}
+	if len(params.EnvelopeRecipients) == 0 {
+		return QueuedSubmission{}, fmt.Errorf("%w: at least one envelope recipient is required", ErrInvalid)
+	}
+	envelopeRecipients := make([]string, 0, len(params.EnvelopeRecipients))
+	for _, recipient := range params.EnvelopeRecipients {
+		normalized, err := NormalizeAddress(recipient)
+		if err != nil {
+			return QueuedSubmission{}, err
+		}
+		envelopeRecipients = append(envelopeRecipients, normalized)
+	}
+
+	reference, err := service.blobs.Put(ctx, raw)
+	if err != nil {
+		return QueuedSubmission{}, fmt.Errorf("store submitted message: %w", err)
+	}
+	metadata, err := service.readMetadata(ctx, reference)
+	if err != nil {
+		return QueuedSubmission{}, err
+	}
+	idempotencyKey, err := newOutboundIdempotencyKey()
+	if err != nil {
+		return QueuedSubmission{}, err
+	}
+	return service.repository.CreateOutboundDelivery(ctx, CreateOutboundDeliveryParams{
+		ProviderBindingID:  params.ProviderBindingID,
+		IdempotencyKey:     idempotencyKey,
+		BlobKey:            reference.Key,
+		BlobSHA256:         reference.SHA256,
+		RawSize:            reference.Size,
+		HeaderMessageID:    metadata.messageID,
+		Subject:            metadata.subject,
+		EnvelopeFrom:       envelopeFrom,
+		EnvelopeRecipients: envelopeRecipients,
+		Participants:       metadata.participants,
+		HeaderSentAt:       metadata.sentAt,
+		SubmittedAt:        service.now().UTC(),
+	})
+}
+
+func (service *Service) CompleteSubmission(
+	ctx context.Context,
+	params CompleteOutboundDeliveryParams,
+) (SentSubmission, error) {
+	service.lifecycle.RLock()
+	defer service.lifecycle.RUnlock()
+
+	return service.repository.CompleteOutboundDelivery(ctx, params)
+}
+
 func (service *Service) OpenRaw(ctx context.Context, messageID int64) (io.ReadCloser, error) {
 	service.lifecycle.RLock()
 	defer service.lifecycle.RUnlock()
