@@ -55,7 +55,7 @@ func TestServeCreatesAndMigratesSQLiteDatabase(t *testing.T) {
 	if err := database.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if migrationCount != 1 {
+	if migrationCount != 3 {
 		t.Fatalf("migration count = %d", migrationCount)
 	}
 }

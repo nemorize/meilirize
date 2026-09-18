@@ -3,12 +3,17 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"meilirize/internal/blob/local"
+	"meilirize/internal/mailbox"
 )
 
 func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
@@ -24,7 +29,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 	assertPragma(t, store.database, "busy_timeout", "5000")
 	assertPragma(t, store.database, "journal_mode", "wal")
 	assertPragma(t, store.database, "synchronous", "1")
-	assertMigrationCount(t, store.database, 1)
+	assertMigrationCount(t, store.database, 3)
 
 	var name string
 	if err := store.database.QueryRowContext(
@@ -53,7 +58,349 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	assertMigrationCount(t, reopened.database, 1)
+	assertMigrationCount(t, reopened.database, 3)
+}
+
+func TestIngestStoresMessageMetadataAndOriginalBytes(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	blobs, err := local.New(filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := mailbox.NewService(store, blobs)
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{DisplayName: "Alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "alice@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.MailboxByName(ctx, address.ID, "inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inbox.Name != "INBOX" || inbox.SpecialUse != mailbox.SpecialUseInbox || inbox.UIDNext != 1 {
+		t.Fatalf("unexpected inbox: %#v", inbox)
+	}
+
+	raw := strings.Join([]string{
+		"Message-ID: <message-1@example.com>",
+		"Date: Fri, 19 Sep 2026 10:30:00 +0900",
+		"From: Alice Sender <sender@Example.COM>",
+		"To: Bob Recipient <bob@example.net>",
+		"Subject: =?UTF-8?B?7JWI64WV7ZWY7IS47JqU?=",
+		"MIME-Version: 1.0",
+		"Content-Type: text/plain; charset=UTF-8",
+		"",
+		"원본 본문입니다.",
+		"",
+	}, "\r\n")
+	internalDate := time.Date(2026, 9, 19, 1, 45, 0, 0, time.UTC)
+	stored, err := service.Ingest(ctx, mailbox.IngestParams{
+		MailboxID:          inbox.ID,
+		EnvelopeFrom:       "bounce@Example.COM",
+		EnvelopeRecipients: []string{"Alice@Example.COM"},
+		InternalDate:       internalDate,
+		Flags:              mailbox.MessageFlags{Seen: true, Flagged: true},
+	}, strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	message := stored.Message
+	if message.Subject != "안녕하세요" || message.HeaderMessageID != "<message-1@example.com>" {
+		t.Fatalf("unexpected message headers: %#v", message)
+	}
+	if message.EnvelopeFrom != "bounce@example.com" {
+		t.Fatalf("envelope from = %q", message.EnvelopeFrom)
+	}
+	if len(message.EnvelopeRecipients) != 1 || message.EnvelopeRecipients[0] != "Alice@example.com" {
+		t.Fatalf("envelope recipients = %#v", message.EnvelopeRecipients)
+	}
+	if message.RawSize != int64(len(raw)) || message.BlobSHA256 == "" || message.BlobKey == "" {
+		t.Fatalf("unexpected blob metadata: %#v", message)
+	}
+	if !hasParticipant(message.Participants, mailbox.ParticipantFrom, "sender@example.com", "Alice Sender") {
+		t.Fatalf("missing sender participant: %#v", message.Participants)
+	}
+	if !hasParticipant(message.Participants, mailbox.ParticipantTo, "bob@example.net", "Bob Recipient") {
+		t.Fatalf("missing recipient participant: %#v", message.Participants)
+	}
+	membership := stored.MailboxMessage
+	if membership.UID != 1 || membership.InternalDate != internalDate || !membership.Flags.Seen || !membership.Flags.Flagged {
+		t.Fatalf("unexpected mailbox message: %#v", membership)
+	}
+
+	reader, err := service.OpenRaw(ctx, message.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	if closeError := reader.Close(); err == nil {
+		err = closeError
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != raw {
+		t.Fatalf("raw message changed:\n%s", got)
+	}
+
+	second, err := service.Ingest(ctx, mailbox.IngestParams{MailboxID: inbox.ID}, strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.MailboxMessage.UID != 2 {
+		t.Fatalf("second UID = %d", second.MailboxMessage.UID)
+	}
+	if second.Message.BlobKey != message.BlobKey {
+		t.Fatalf("duplicate message blob keys differ: %q != %q", second.Message.BlobKey, message.BlobKey)
+	}
+	updatedInbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedInbox.UIDNext != 3 {
+		t.Fatalf("UIDNEXT = %d", updatedInbox.UIDNext)
+	}
+}
+
+func TestCreateMessageRollsBackMetadataAndUIDOnFailure(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "rollback@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	_, err = store.CreateMessage(ctx, mailbox.CreateMessageParams{
+		MailboxID:    inbox.ID,
+		BlobKey:      "sha256/" + strings.Repeat("0", 64),
+		BlobSHA256:   strings.Repeat("0", 64),
+		ReceivedAt:   now,
+		InternalDate: now,
+		Participants: []mailbox.MessageParticipant{
+			{Kind: "invalid", Address: "sender@example.com"},
+		},
+	})
+	if !errors.Is(err, mailbox.ErrInvalid) {
+		t.Fatalf("CreateMessage error = %v", err)
+	}
+
+	var messageCount int
+	if err := store.database.QueryRowContext(ctx, "SELECT COUNT(*) FROM messages").Scan(&messageCount); err != nil {
+		t.Fatal(err)
+	}
+	if messageCount != 0 {
+		t.Fatalf("message count = %d", messageCount)
+	}
+	unchangedInbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchangedInbox.UIDNext != 1 {
+		t.Fatalf("UIDNEXT after rollback = %d", unchangedInbox.UIDNext)
+	}
+}
+
+func hasParticipant(
+	participants []mailbox.MessageParticipant,
+	kind mailbox.ParticipantKind,
+	address string,
+	displayName string,
+) bool {
+	for _, participant := range participants {
+		if participant.Kind == kind && participant.Address == address && participant.DisplayName == displayName {
+			return true
+		}
+	}
+	return false
+}
+
+func TestStorePersistsMailboxOwnershipAndProviderBindings(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{DisplayName: " Alice "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.ID <= 0 || user.DisplayName != "Alice" || user.CreatedAt.IsZero() || user.UpdatedAt.IsZero() {
+		t.Fatalf("unexpected user: %#v", user)
+	}
+
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "Alice@Example.COM",
+		DisplayName: " Personal ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if address.OwnerUserID != user.ID || address.Address != "Alice@example.com" || address.DisplayName != "Personal" {
+		t.Fatalf("unexpected address: %#v", address)
+	}
+
+	lookedUp, err := store.AddressByEmail(ctx, "alice@EXAMPLE.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookedUp.ID != address.ID {
+		t.Fatalf("address ID = %d, want %d", lookedUp.ID, address.ID)
+	}
+
+	binding, err := store.BindProvider(ctx, mailbox.BindProviderParams{
+		AddressID:      address.ID,
+		Provider:       " Mailgun ",
+		SendEnabled:    true,
+		ReceiveEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.Provider != "mailgun" || !binding.SendEnabled || !binding.ReceiveEnabled {
+		t.Fatalf("unexpected provider binding: %#v", binding)
+	}
+
+	bindings, err := store.ProviderBindings(ctx, address.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 1 || bindings[0].ID != binding.ID {
+		t.Fatalf("provider bindings = %#v", bindings)
+	}
+}
+
+func TestStoreEnforcesMailboxRelationships(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	_, err = store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: 999,
+		Address:     "missing-owner@example.com",
+	})
+	if !errors.Is(err, mailbox.ErrConflict) {
+		t.Fatalf("missing owner error = %v", err)
+	}
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "owner@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "OWNER@example.com",
+	})
+	if !errors.Is(err, mailbox.ErrConflict) {
+		t.Fatalf("duplicate address error = %v", err)
+	}
+
+	_, err = store.BindProvider(ctx, mailbox.BindProviderParams{
+		AddressID:   address.ID,
+		Provider:    "mailgun",
+		SendEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.BindProvider(ctx, mailbox.BindProviderParams{
+		AddressID:      address.ID,
+		Provider:       "MAILGUN",
+		ReceiveEnabled: true,
+	})
+	if !errors.Is(err, mailbox.ErrConflict) {
+		t.Fatalf("duplicate provider error = %v", err)
+	}
+
+	if _, err := store.User(ctx, 999); !errors.Is(err, mailbox.ErrNotFound) {
+		t.Fatalf("missing user error = %v", err)
+	}
+	if _, err := store.AddressByEmail(ctx, "missing@example.com"); !errors.Is(err, mailbox.ErrNotFound) {
+		t.Fatalf("missing address error = %v", err)
+	}
+}
+
+func TestDeletingUserCascadesMailboxRecords(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "cascade@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BindProvider(ctx, mailbox.BindProviderParams{
+		AddressID:   address.ID,
+		Provider:    "example",
+		SendEnabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.database.ExecContext(ctx, "DELETE FROM users WHERE id = ?", user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Address(ctx, address.ID); !errors.Is(err, mailbox.ErrNotFound) {
+		t.Fatalf("address after deleting user: %v", err)
+	}
+	bindings, err := store.ProviderBindings(ctx, address.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 0 {
+		t.Fatalf("provider bindings after deleting user: %#v", bindings)
+	}
 }
 
 func TestMigrateAppliesInOrderAndDetectsChanges(t *testing.T) {
