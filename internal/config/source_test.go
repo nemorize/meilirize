@@ -124,7 +124,7 @@ func TestValidateFileSyntax(t *testing.T) {
 }
 
 func TestValidateWithoutFile(t *testing.T) {
-	t.Setenv(SMTPListenEnvironment, Defaults().SMTP.Listen)
+	t.Setenv(SMTPListenPlainEnvironment, Defaults().SMTP.ListenPlain)
 	t.Setenv(SMTPHostnameEnvironment, Defaults().SMTP.Hostname)
 	if err := Validate(newSources("", FileNotSelected)); err != nil {
 		t.Fatal(err)

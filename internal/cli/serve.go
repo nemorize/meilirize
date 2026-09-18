@@ -25,22 +25,45 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 				return err
 			}
 
+			resolvedListeners, err := configuration.SMTP.ResolvedListeners()
+			if err != nil {
+				return err
+			}
+			listenerConfigurations := make([]smtpd.ListenerConfig, 0, len(resolvedListeners))
+			for _, listener := range resolvedListeners {
+				listenerConfigurations = append(listenerConfigurations, smtpd.ListenerConfig{
+					Address: listener.Address,
+					Mode:    smtpd.Mode(listener.Mode),
+				})
+			}
+
 			server, err := smtpd.New(smtpd.Config{
-				ListenAddress: configuration.SMTP.Listen,
-				Hostname:      configuration.SMTP.Hostname,
+				Listeners:   listenerConfigurations,
+				Hostname:    configuration.SMTP.Hostname,
+				TLSCertFile: configuration.SMTP.TLS.CertFile,
+				TLSKeyFile:  configuration.SMTP.TLS.KeyFile,
 			})
 			if err != nil {
 				return err
 			}
-			listener, err := server.Listen(command.Context())
+			listeners, err := server.Listen(command.Context())
 			if err != nil {
 				return err
 			}
-			if _, err := fmt.Fprintf(command.OutOrStdout(), "SMTP listening on %s\n", listener.Addr()); err != nil {
-				_ = listener.Close()
-				return err
+			for _, listener := range listeners {
+				if _, err := fmt.Fprintf(
+					command.OutOrStdout(),
+					"SMTP listening on %s (%s)\n",
+					listener.Addr(),
+					listener.Mode(),
+				); err != nil {
+					for _, listener := range listeners {
+						_ = listener.Close()
+					}
+					return err
+				}
 			}
-			return server.Serve(command.Context(), listener)
+			return server.Serve(command.Context(), listeners)
 		},
 	}
 }

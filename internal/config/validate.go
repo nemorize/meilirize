@@ -32,11 +32,23 @@ func load(sources Sources, lookupEnvironment func(string) (string, bool)) (Confi
 	}
 
 	if lookupEnvironment != nil {
-		if value, ok := lookupEnvironment(SMTPListenEnvironment); ok {
-			configuration.SMTP.Listen = value
+		if value, ok := lookupEnvironment(SMTPListenPlainEnvironment); ok {
+			configuration.SMTP.ListenPlain = value
+		}
+		if value, ok := lookupEnvironment(SMTPListenStartTLSEnvironment); ok {
+			configuration.SMTP.ListenStartTLS = value
+		}
+		if value, ok := lookupEnvironment(SMTPListenImplicitEnvironment); ok {
+			configuration.SMTP.ListenImplicit = value
 		}
 		if value, ok := lookupEnvironment(SMTPHostnameEnvironment); ok {
 			configuration.SMTP.Hostname = value
+		}
+		if value, ok := lookupEnvironment(SMTPTLSCertEnvironment); ok {
+			configuration.SMTP.TLS.CertFile = value
+		}
+		if value, ok := lookupEnvironment(SMTPTLSKeyEnvironment); ok {
+			configuration.SMTP.TLS.KeyFile = value
 		}
 	}
 

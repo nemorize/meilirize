@@ -62,7 +62,7 @@ func TestDoctorValidatesConfigurationWithoutShowingValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(
 		configPath,
-		[]byte("[smtp]\nlisten = \"127.0.0.1:2525\"\nhostname = \"mail.example\"\n"),
+		[]byte("[smtp]\nlisten_plain = \"127.0.0.1:2525\"\nhostname = \"mail.example\"\n"),
 		0o600,
 	); err != nil {
 		t.Fatal(err)

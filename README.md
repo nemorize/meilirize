@@ -12,8 +12,9 @@ It is designed to turn provider APIs and webhooks into:
 > [!NOTE]
 > Meilirize is in early development. An experimental SMTP endpoint is
 > available for protocol development, but it does not accept or deliver mail
-> yet. Authentication, TLS, inbound delivery, submission, IMAP, POP, webmail,
-> and mobile apps are not implemented.
+> yet. Plain, STARTTLS, and implicit TLS listeners can be enabled independently
+> using SMTP-specific settings and certificates. Authentication, inbound
+> delivery, submission, IMAP, POP, webmail, and mobile apps are not implemented.
 
 ## License
 
