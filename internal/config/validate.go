@@ -53,6 +53,9 @@ func load(sources Sources, lookupEnvironment func(string) (string, bool)) (Confi
 		if value, ok := lookupEnvironment(DatabasePathEnvironment); ok {
 			configuration.Database.Path = value
 		}
+		if value, ok := lookupEnvironment(StorageBlobPathEnvironment); ok {
+			configuration.Storage.BlobPath = value
+		}
 	}
 
 	if err := configuration.Validate(); err != nil {

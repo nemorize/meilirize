@@ -16,10 +16,12 @@ import (
 func TestServeCreatesAndMigratesSQLiteDatabase(t *testing.T) {
 	directory := t.TempDir()
 	databasePath := filepath.Join(directory, "meilirize.db")
+	blobPath := filepath.Join(directory, "blobs")
 	configPath := filepath.Join(directory, "config.toml")
 	contents := fmt.Sprintf(
-		"[smtp]\nlisten_plain = \"127.0.0.1:0\"\n\n[database]\npath = %q\n",
+		"[smtp]\nlisten_plain = \"127.0.0.1:0\"\n\n[database]\npath = %q\n\n[storage]\nblob_path = %q\n",
 		databasePath,
+		blobPath,
 	)
 	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
@@ -55,8 +57,11 @@ func TestServeCreatesAndMigratesSQLiteDatabase(t *testing.T) {
 	if err := database.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if migrationCount != 4 {
+	if migrationCount != 5 {
 		t.Fatalf("migration count = %d", migrationCount)
+	}
+	if info, err := os.Stat(filepath.Join(blobPath, ".tmp")); err != nil || !info.IsDir() {
+		t.Fatalf("blob directory was not initialized: %v", err)
 	}
 }
 

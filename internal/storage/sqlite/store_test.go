@@ -12,6 +12,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"meilirize/internal/blob"
 	"meilirize/internal/blob/local"
 	"meilirize/internal/mailbox"
 )
@@ -29,7 +30,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 	assertPragma(t, store.database, "busy_timeout", "5000")
 	assertPragma(t, store.database, "journal_mode", "wal")
 	assertPragma(t, store.database, "synchronous", "1")
-	assertMigrationCount(t, store.database, 4)
+	assertMigrationCount(t, store.database, 5)
 
 	var name string
 	if err := store.database.QueryRowContext(
@@ -58,7 +59,7 @@ func TestOpenConfiguresDatabaseAndRunsMigrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	assertMigrationCount(t, reopened.database, 4)
+	assertMigrationCount(t, reopened.database, 5)
 }
 
 func TestRecreatedInboxReceivesNewUIDValidity(t *testing.T) {
@@ -169,6 +170,40 @@ func TestUIDValiditySequenceMigratesExistingMailboxes(t *testing.T) {
 			secondInbox.UIDValidity,
 		)
 	}
+}
+
+func TestOrphanMessageMigrationPrunesExistingRows(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	if _, err := database.ExecContext(ctx, createMigrationsTable); err != nil {
+		t.Fatal(err)
+	}
+	migrations, err := loadMigrations(migrationFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range migrations[:4] {
+		if err := applyMigration(ctx, database, migration); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.ExecContext(
+		ctx,
+		`INSERT INTO messages
+            (blob_key, blob_sha256, raw_size, received_at)
+         VALUES (?, ?, 1, ?)`,
+		"sha256/"+strings.Repeat("0", 64),
+		strings.Repeat("0", 64),
+		time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, database, "messages", 1)
+
+	if err := migrate(ctx, database, migrationFiles); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, database, "messages", 0)
 }
 
 func TestIngestStoresMessageMetadataAndOriginalBytes(t *testing.T) {
@@ -336,6 +371,192 @@ func TestCreateMessageRollsBackMetadataAndUIDOnFailure(t *testing.T) {
 	}
 	if unchangedInbox.UIDNext != 1 {
 		t.Fatalf("UIDNEXT after rollback = %d", unchangedInbox.UIDNext)
+	}
+}
+
+func TestFailedIngestBlobsAreCollected(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	blobStore, err := local.New(filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := mailbox.NewService(store, blobStore)
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "failure@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Ingest(ctx, mailbox.IngestParams{
+		MailboxID: inbox.ID,
+	}, strings.NewReader("malformed header\r\n\r\nbody")); err == nil {
+		t.Fatal("expected MIME parsing error")
+	}
+	waitForBlobAge()
+	result, err := service.CollectGarbage(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Deleted != 1 {
+		t.Fatalf("garbage collected after parse failure = %#v", result)
+	}
+
+	validRaw := "From: sender@example.com\r\nTo: failure@example.com\r\n\r\nbody"
+	if _, err := service.Ingest(ctx, mailbox.IngestParams{
+		MailboxID: 999,
+	}, strings.NewReader(validRaw)); !errors.Is(err, mailbox.ErrNotFound) {
+		t.Fatalf("missing mailbox error = %v", err)
+	}
+	waitForBlobAge()
+	result, err = service.CollectGarbage(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Deleted != 1 {
+		t.Fatalf("garbage collected after database failure = %#v", result)
+	}
+}
+
+func TestDeletingAddressPrunesMessageAndCollectsBlob(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	blobStore, err := local.New(filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := mailbox.NewService(store, blobStore)
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "delete@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := service.Ingest(
+		ctx,
+		mailbox.IngestParams{MailboxID: inbox.ID},
+		strings.NewReader("From: sender@example.com\r\nTo: delete@example.com\r\n\r\nbody"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.database.ExecContext(ctx, "DELETE FROM addresses WHERE id = ?", address.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, store.database, "messages", 0)
+	waitForBlobAge()
+	result, err := service.CollectGarbage(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Deleted != 1 {
+		t.Fatalf("garbage collection result = %#v", result)
+	}
+	if _, err := blobStore.Open(ctx, stored.Message.BlobKey); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("deleted blob open error = %v", err)
+	}
+}
+
+func TestSharedBlobSurvivesUntilLastMessageIsRemoved(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	blobStore, err := local.New(filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := mailbox.NewService(store, blobStore)
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses := make([]mailbox.Address, 0, 2)
+	mailboxes := make([]mailbox.Mailbox, 0, 2)
+	for _, email := range []string{"first@example.com", "second@example.com"} {
+		address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+			OwnerUserID: user.ID,
+			Address:     email,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addresses = append(addresses, address)
+		mailboxes = append(mailboxes, inbox)
+	}
+	raw := "From: sender@example.com\r\nTo: both@example.com\r\n\r\nshared"
+	first, err := service.Ingest(ctx, mailbox.IngestParams{MailboxID: mailboxes[0].ID}, strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.Ingest(ctx, mailbox.IngestParams{MailboxID: mailboxes[1].ID}, strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Message.BlobKey != second.Message.BlobKey {
+		t.Fatalf("shared blob keys differ: %q != %q", first.Message.BlobKey, second.Message.BlobKey)
+	}
+
+	if _, err := store.database.ExecContext(ctx, "DELETE FROM addresses WHERE id = ?", addresses[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, store.database, "messages", 1)
+	waitForBlobAge()
+	result, err := service.CollectGarbage(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Deleted != 0 {
+		t.Fatalf("live shared blob was collected: %#v", result)
+	}
+
+	if _, err := store.database.ExecContext(ctx, "DELETE FROM addresses WHERE id = ?", addresses[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	assertTableCount(t, store.database, "messages", 0)
+	result, err = service.CollectGarbage(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Deleted != 1 {
+		t.Fatalf("unreferenced shared blob was not collected: %#v", result)
 	}
 }
 
@@ -619,4 +840,19 @@ func assertMigrationCount(t *testing.T, database *sql.DB, want int) {
 	if count != want {
 		t.Fatalf("migration count = %d, want %d", count, want)
 	}
+}
+
+func assertTableCount(t *testing.T, database *sql.DB, table string, want int) {
+	t.Helper()
+	var count int
+	if err := database.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("%s count = %d, want %d", table, count, want)
+	}
+}
+
+func waitForBlobAge() {
+	time.Sleep(10 * time.Millisecond)
 }

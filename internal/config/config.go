@@ -14,6 +14,7 @@ const (
 	SMTPTLSCertEnvironment        = EnvironmentPrefix + "SMTP_TLS_CERT_FILE"
 	SMTPTLSKeyEnvironment         = EnvironmentPrefix + "SMTP_TLS_KEY_FILE"
 	DatabasePathEnvironment       = EnvironmentPrefix + "DATABASE_PATH"
+	StorageBlobPathEnvironment    = EnvironmentPrefix + "STORAGE_BLOB_PATH"
 
 	SMTPModePlain    = "plain"
 	SMTPModeStartTLS = "starttls"
@@ -23,6 +24,7 @@ const (
 type Config struct {
 	SMTP     SMTPConfig     `toml:"smtp"`
 	Database DatabaseConfig `toml:"database"`
+	Storage  StorageConfig  `toml:"storage"`
 }
 
 type SMTPConfig struct {
@@ -47,6 +49,10 @@ type DatabaseConfig struct {
 	Path string `toml:"path"`
 }
 
+type StorageConfig struct {
+	BlobPath string `toml:"blob_path"`
+}
+
 func Defaults() Config {
 	return Config{
 		SMTP: SMTPConfig{
@@ -55,6 +61,9 @@ func Defaults() Config {
 		},
 		Database: DatabaseConfig{
 			Path: "meilirize.db",
+		},
+		Storage: StorageConfig{
+			BlobPath: "meilirize-data/blobs",
 		},
 	}
 }
@@ -67,8 +76,11 @@ func (configuration Config) Validate() error {
 	if strings.ContainsAny(hostname, " \t\r\n") {
 		return fmt.Errorf("smtp.hostname must not contain whitespace")
 	}
-	if configuration.Database.Path == "" {
+	if strings.TrimSpace(configuration.Database.Path) == "" {
 		return fmt.Errorf("database.path must not be empty")
+	}
+	if strings.TrimSpace(configuration.Storage.BlobPath) == "" {
+		return fmt.Errorf("storage.blob_path must not be empty")
 	}
 
 	listeners, err := configuration.SMTP.ResolvedListeners()

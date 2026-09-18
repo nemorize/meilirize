@@ -3,12 +3,21 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 
+	bloblocal "meilirize/internal/blob/local"
 	"meilirize/internal/config"
+	"meilirize/internal/mailbox"
 	"meilirize/internal/smtpd"
 	"meilirize/internal/storage/sqlite"
+)
+
+const (
+	blobGarbageCollectionInterval = 24 * time.Hour
+	blobGarbageCollectionGrace    = 24 * time.Hour
 )
 
 func newServeCommand(configPath *string, newResolver configResolverFactory) *cobra.Command {
@@ -33,6 +42,17 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 			defer func() {
 				runError = errors.Join(runError, store.Close())
 			}()
+			blobStore, err := bloblocal.New(configuration.Storage.BlobPath)
+			if err != nil {
+				return err
+			}
+			mailboxService := mailbox.NewService(store, blobStore)
+			if _, err := mailboxService.CollectGarbage(
+				command.Context(),
+				blobGarbageCollectionGrace,
+			); err != nil {
+				return err
+			}
 
 			resolvedListeners, err := configuration.SMTP.ResolvedListeners()
 			if err != nil {
@@ -72,7 +92,18 @@ func newServeCommand(configPath *string, newResolver configResolverFactory) *cob
 					return err
 				}
 			}
-			return server.Serve(command.Context(), listeners)
+			group, groupContext := errgroup.WithContext(command.Context())
+			group.Go(func() error {
+				return server.Serve(groupContext, listeners)
+			})
+			group.Go(func() error {
+				return mailboxService.RunGarbageCollection(
+					groupContext,
+					blobGarbageCollectionInterval,
+					blobGarbageCollectionGrace,
+				)
+			})
+			return group.Wait()
 		},
 	}
 }

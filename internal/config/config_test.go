@@ -75,6 +75,9 @@ key_file = "file-key.pem"
 
 [database]
 path = "file.db"
+
+[storage]
+blob_path = "file-blobs"
 `)
 	sources := newSources(path, FileSelectedByFlag)
 	environment := map[string]string{
@@ -85,6 +88,7 @@ path = "file.db"
 		SMTPTLSCertEnvironment:        "env-cert.pem",
 		SMTPTLSKeyEnvironment:         "env-key.pem",
 		DatabasePathEnvironment:       "env.db",
+		StorageBlobPathEnvironment:    "env-blobs",
 	}
 
 	configuration, err := load(sources, func(name string) (string, bool) {
@@ -114,6 +118,9 @@ path = "file.db"
 	}
 	if configuration.Database.Path != "env.db" {
 		t.Fatalf("database path = %q", configuration.Database.Path)
+	}
+	if configuration.Storage.BlobPath != "env-blobs" {
+		t.Fatalf("storage blob path = %q", configuration.Storage.BlobPath)
 	}
 }
 
@@ -168,6 +175,9 @@ func TestLoadRejectsInvalidSMTPSettings(t *testing.T) {
 		},
 		"database path": {
 			DatabasePathEnvironment: "",
+		},
+		"storage blob path": {
+			StorageBlobPathEnvironment: "",
 		},
 		"STARTTLS listen": {
 			SMTPListenStartTLSEnvironment: "2587",

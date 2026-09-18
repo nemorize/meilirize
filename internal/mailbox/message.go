@@ -102,4 +102,5 @@ type MessageRepository interface {
 	MailboxByName(context.Context, int64, string) (Mailbox, error)
 	Message(context.Context, int64) (Message, error)
 	CreateMessage(context.Context, CreateMessageParams) (StoredMessage, error)
+	ReferencedBlobKeys(context.Context) (map[string]struct{}, error)
 }

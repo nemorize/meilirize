@@ -96,6 +96,27 @@ func (store *Store) Message(ctx context.Context, id int64) (mailbox.Message, err
 	return message, nil
 }
 
+func (store *Store) ReferencedBlobKeys(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := store.database.QueryContext(ctx, "SELECT DISTINCT blob_key FROM messages")
+	if err != nil {
+		return nil, fmt.Errorf("read referenced blob keys: %w", err)
+	}
+	defer rows.Close()
+
+	keys := make(map[string]struct{})
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("scan referenced blob key: %w", err)
+		}
+		keys[key] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate referenced blob keys: %w", err)
+	}
+	return keys, nil
+}
+
 func (store *Store) CreateMessage(
 	ctx context.Context,
 	params mailbox.CreateMessageParams,

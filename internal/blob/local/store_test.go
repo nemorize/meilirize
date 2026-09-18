@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"meilirize/internal/blob"
 )
@@ -81,5 +83,66 @@ func TestStoreHonorsCanceledContext(t *testing.T) {
 	}
 	if _, err := store.Open(ctx, "sha256/"+strings.Repeat("0", 64)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Open error = %v", err)
+	}
+}
+
+func TestStoreCollectsOnlyOldUnreferencedBlobs(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	live, err := store.Put(ctx, strings.NewReader("live"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := store.Put(ctx, strings.NewReader("orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recent, err := store.Put(ctx, strings.NewReader("recent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	for _, reference := range []blob.Ref{live, orphan} {
+		path, err := store.pathForKey(reference.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	temporaryPath := filepath.Join(store.temporaryRoot, "blob-abandoned")
+	if err := os.WriteFile(temporaryPath, []byte("temporary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(temporaryPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := store.CollectGarbage(ctx, blob.GarbageCollection{
+		LiveKeys:     map[string]struct{}{live.Key: {}},
+		DeleteBefore: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Scanned != 4 || result.Deleted != 2 || result.DeletedSize != orphan.Size+int64(len("temporary")) {
+		t.Fatalf("garbage collection result = %#v", result)
+	}
+	if reader, err := store.Open(ctx, live.Key); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = reader.Close()
+	}
+	if _, err := store.Open(ctx, orphan.Key); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("orphan open error = %v", err)
+	}
+	if reader, err := store.Open(ctx, recent.Key); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = reader.Close()
 	}
 }

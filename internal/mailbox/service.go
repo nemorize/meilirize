@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/mail"
 	"strings"
+	"sync"
 	"time"
 
 	"meilirize/internal/blob"
@@ -24,6 +25,7 @@ type Service struct {
 	repository MessageRepository
 	blobs      blob.Store
 	now        func() time.Time
+	lifecycle  sync.RWMutex
 }
 
 func NewService(repository MessageRepository, blobs blob.Store) *Service {
@@ -39,6 +41,9 @@ func (service *Service) Ingest(
 	params IngestParams,
 	raw io.Reader,
 ) (StoredMessage, error) {
+	service.lifecycle.RLock()
+	defer service.lifecycle.RUnlock()
+
 	if params.MailboxID <= 0 {
 		return StoredMessage{}, fmt.Errorf("%w: mailbox ID must be positive", ErrInvalid)
 	}
@@ -86,6 +91,9 @@ func (service *Service) Ingest(
 }
 
 func (service *Service) OpenRaw(ctx context.Context, messageID int64) (io.ReadCloser, error) {
+	service.lifecycle.RLock()
+	defer service.lifecycle.RUnlock()
+
 	message, err := service.repository.Message(ctx, messageID)
 	if err != nil {
 		return nil, err
@@ -95,6 +103,58 @@ func (service *Service) OpenRaw(ctx context.Context, messageID int64) (io.ReadCl
 		return nil, fmt.Errorf("open raw message %d: %w", messageID, err)
 	}
 	return reader, nil
+}
+
+func (service *Service) CollectGarbage(
+	ctx context.Context,
+	gracePeriod time.Duration,
+) (blob.GarbageCollectionResult, error) {
+	if gracePeriod < 0 {
+		return blob.GarbageCollectionResult{}, fmt.Errorf(
+			"%w: blob garbage collection grace period must not be negative",
+			ErrInvalid,
+		)
+	}
+	service.lifecycle.Lock()
+	defer service.lifecycle.Unlock()
+
+	liveKeys, err := service.repository.ReferencedBlobKeys(ctx)
+	if err != nil {
+		return blob.GarbageCollectionResult{}, err
+	}
+	result, err := service.blobs.CollectGarbage(ctx, blob.GarbageCollection{
+		LiveKeys:     liveKeys,
+		DeleteBefore: service.now().UTC().Add(-gracePeriod),
+	})
+	if err != nil {
+		return result, fmt.Errorf("collect message blobs: %w", err)
+	}
+	return result, nil
+}
+
+func (service *Service) RunGarbageCollection(
+	ctx context.Context,
+	interval time.Duration,
+	gracePeriod time.Duration,
+) error {
+	if interval <= 0 {
+		return fmt.Errorf("%w: blob garbage collection interval must be positive", ErrInvalid)
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if _, err := service.CollectGarbage(ctx, gracePeriod); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		}
+	}
 }
 
 type parsedMetadata struct {

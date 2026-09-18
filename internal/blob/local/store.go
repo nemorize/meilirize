@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"meilirize/internal/blob"
 )
@@ -24,6 +25,7 @@ var _ blob.Store = (*Store)(nil)
 type Store struct {
 	root          string
 	temporaryRoot string
+	mutex         sync.RWMutex
 }
 
 func New(root string) (*Store, error) {
@@ -42,6 +44,9 @@ func New(root string) (*Store, error) {
 }
 
 func (store *Store) Put(ctx context.Context, source io.Reader) (reference blob.Ref, resultError error) {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+
 	if source == nil {
 		return blob.Ref{}, fmt.Errorf("store local blob: source must not be nil")
 	}
@@ -105,6 +110,9 @@ func (store *Store) Put(ctx context.Context, source io.Reader) (reference blob.R
 }
 
 func (store *Store) Open(ctx context.Context, key string) (io.ReadCloser, error) {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("open local blob: %w", err)
 	}
@@ -122,6 +130,87 @@ func (store *Store) Open(ctx context.Context, key string) (io.ReadCloser, error)
 	return file, nil
 }
 
+func (store *Store) CollectGarbage(
+	ctx context.Context,
+	collection blob.GarbageCollection,
+) (blob.GarbageCollectionResult, error) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+
+	if collection.DeleteBefore.IsZero() {
+		return blob.GarbageCollectionResult{}, fmt.Errorf("collect local blob garbage: cutoff must not be zero")
+	}
+	root := filepath.Join(store.root, algorithmDirectory)
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return blob.GarbageCollectionResult{}, nil
+	} else if err != nil {
+		return blob.GarbageCollectionResult{}, fmt.Errorf("inspect local blob store: %w", err)
+	}
+
+	var result blob.GarbageCollectionResult
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkError error) error {
+		if walkError != nil {
+			return walkError
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() || !entry.Type().IsRegular() {
+			return nil
+		}
+		key, ok := store.keyForPath(path)
+		if !ok {
+			return nil
+		}
+		result.Scanned++
+		if _, live := collection.LiveKeys[key]; live {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.ModTime().Before(collection.DeleteBefore) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		result.Deleted++
+		result.DeletedSize += info.Size()
+		return nil
+	})
+	if err != nil {
+		return result, fmt.Errorf("collect local blob garbage: %w", err)
+	}
+	temporaryEntries, err := os.ReadDir(store.temporaryRoot)
+	if err != nil {
+		return result, fmt.Errorf("read temporary blob directory: %w", err)
+	}
+	for _, entry := range temporaryEntries {
+		if err := ctx.Err(); err != nil {
+			return result, fmt.Errorf("collect temporary blob garbage: %w", err)
+		}
+		if entry.IsDir() || !entry.Type().IsRegular() || !strings.HasPrefix(entry.Name(), "blob-") {
+			continue
+		}
+		result.Scanned++
+		info, err := entry.Info()
+		if err != nil {
+			return result, fmt.Errorf("inspect temporary blob: %w", err)
+		}
+		if !info.ModTime().Before(collection.DeleteBefore) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(store.temporaryRoot, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return result, fmt.Errorf("remove temporary blob: %w", err)
+		}
+		result.Deleted++
+		result.DeletedSize += info.Size()
+	}
+	return result, nil
+}
+
 func (store *Store) pathForKey(key string) (string, error) {
 	prefix := algorithmDirectory + "/"
 	if !strings.HasPrefix(key, prefix) {
@@ -135,6 +224,23 @@ func (store *Store) pathForKey(key string) (string, error) {
 		return "", fmt.Errorf("%w: %q", blob.ErrInvalidKey, key)
 	}
 	return filepath.Join(store.root, algorithmDirectory, hash[:2], hash[2:]), nil
+}
+
+func (store *Store) keyForPath(path string) (string, bool) {
+	relative, err := filepath.Rel(filepath.Join(store.root, algorithmDirectory), path)
+	if err != nil {
+		return "", false
+	}
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	if len(parts) != 2 || len(parts[0]) != 2 || len(parts[1]) != sha256.Size*2-2 {
+		return "", false
+	}
+	hash := parts[0] + parts[1]
+	key := algorithmDirectory + "/" + hash
+	if _, err := store.pathForKey(key); err != nil {
+		return "", false
+	}
+	return key, true
 }
 
 func copyWithContext(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
