@@ -11,9 +11,8 @@ import (
 )
 
 const (
-	groupRuntime    = "runtime"
-	groupManagement = "management"
-	groupUtility    = "utility"
+	groupRuntime = "runtime"
+	groupUtility = "utility"
 )
 
 func Execute(
@@ -47,7 +46,6 @@ func NewRootCommand(info buildinfo.Info) *cobra.Command {
 	root.SetUsageFunc(renderUsage)
 	root.AddGroup(
 		&cobra.Group{ID: groupRuntime, Title: "Runtime"},
-		&cobra.Group{ID: groupManagement, Title: "Management"},
 		&cobra.Group{ID: groupUtility, Title: "Utilities"},
 	)
 	root.SetHelpCommandGroupID(groupUtility)
@@ -61,11 +59,7 @@ func NewRootCommand(info buildinfo.Info) *cobra.Command {
 
 	root.AddCommand(
 		newPlaceholderCommand("serve", "Run the server in the foreground", groupRuntime),
-		newPlaceholderCommand("doctor", "Check whether the service is ready to run", groupRuntime),
-		newConfigCommand(&configPath, config.NewResolver),
-		newUserCommand(),
-		newAddressCommand(),
-		newProviderCommand(),
+		newDoctorCommand(&configPath, config.NewResolver),
 		newVersionCommand(info),
 	)
 	root.InitDefaultHelpCmd()

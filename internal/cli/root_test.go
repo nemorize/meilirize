@@ -29,11 +29,6 @@ func TestRootHelpListsCommandGroups(t *testing.T) {
 		"Runtime",
 		"serve",
 		"doctor",
-		"Management",
-		"config",
-		"user",
-		"address",
-		"provider",
 		"Utilities",
 		"version",
 		"completion",
@@ -43,7 +38,10 @@ func TestRootHelpListsCommandGroups(t *testing.T) {
 			t.Errorf("help does not contain %q:\n%s", expected, output)
 		}
 	}
-	for _, unwanted := range []string{"init", "start", "stop", "restart", "status", "daemon", "migrate"} {
+	for _, unwanted := range []string{
+		"init", "start", "stop", "restart", "status", "daemon", "migrate",
+		"config", "user", "address", "provider",
+	} {
 		if strings.Contains(output, "  "+unwanted+" ") {
 			t.Errorf("help unexpectedly contains %q:\n%s", unwanted, output)
 		}
@@ -60,56 +58,35 @@ func TestPlaceholderCommandOnlyShowsHelp(t *testing.T) {
 	}
 }
 
-func TestCommandGroupOnlyShowsHelp(t *testing.T) {
-	output, err := executeForTest("user")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(output, "meilirize user <command> [flags]") || !strings.Contains(output, "password") {
-		t.Fatalf("unexpected output:\n%s", output)
-	}
-}
-
-func TestNestedCommandsAreRegistered(t *testing.T) {
-	root := NewRootCommand(testBuild)
-	for _, commandPath := range [][]string{
-		{"config", "show"},
-		{"config", "validate"},
-		{"user", "add"},
-		{"user", "password"},
-		{"address", "set-primary"},
-		{"provider", "test"},
-		{"provider", "remove"},
-	} {
-		command, remaining, err := root.Find(commandPath)
-		if err != nil {
-			t.Fatalf("find %v: %v", commandPath, err)
-		}
-		if len(remaining) != 0 || command.Name() != commandPath[len(commandPath)-1] {
-			t.Fatalf("find %v returned %q with remaining %v", commandPath, command.Name(), remaining)
-		}
-	}
-}
-
-func TestConfigShowUsesExplicitFileAndEnvironment(t *testing.T) {
+func TestDoctorValidatesConfigurationWithoutShowingValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(configPath, []byte("[server]\nport = 2525\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	output, err := executeForTest("config", "show", "--config", configPath)
+	output, err := executeForTest("doctor", "--config", configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{
-		"File: " + configPath,
-		"File selection: --config",
-		"Environment: MEILIRIZE_*",
-		"Precedence: flags > environment > file > defaults",
-	} {
-		if !strings.Contains(output, expected) {
-			t.Errorf("output does not contain %q:\n%s", expected, output)
+	if output != "Configuration: OK\n" {
+		t.Fatalf("unexpected output: %q", output)
+	}
+	for _, secret := range []string{configPath, "server", "2525"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("doctor output exposes %q: %s", secret, output)
 		}
+	}
+}
+
+func TestDoctorRejectsMalformedConfiguration(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("broken = [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := executeForTest("doctor", "--config", configPath)
+	if err == nil || !strings.Contains(err.Error(), "parse config file") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
