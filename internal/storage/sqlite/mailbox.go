@@ -22,7 +22,13 @@ type rowScanner interface {
 }
 
 func (store *Store) CreateUser(ctx context.Context, params mailbox.CreateUserParams) (mailbox.User, error) {
-	result, err := store.database.ExecContext(
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return mailbox.User{}, fmt.Errorf("begin user transaction: %w", err)
+	}
+	defer transaction.Rollback()
+
+	result, err := transaction.ExecContext(
 		ctx,
 		"INSERT INTO users (display_name) VALUES (?)",
 		strings.TrimSpace(params.DisplayName),
@@ -34,18 +40,21 @@ func (store *Store) CreateUser(ctx context.Context, params mailbox.CreateUserPar
 	if err != nil {
 		return mailbox.User{}, fmt.Errorf("read created user ID: %w", err)
 	}
-	return store.User(ctx, id)
+	user, err := userByID(ctx, transaction, id)
+	if err != nil {
+		return mailbox.User{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return mailbox.User{}, fmt.Errorf("commit user transaction: %w", err)
+	}
+	return user, nil
 }
 
 func (store *Store) User(ctx context.Context, id int64) (mailbox.User, error) {
 	if id <= 0 {
 		return mailbox.User{}, fmt.Errorf("%w: user ID must be positive", mailbox.ErrInvalid)
 	}
-	return scanUser(store.database.QueryRowContext(
-		ctx,
-		"SELECT id, display_name, created_at, updated_at FROM users WHERE id = ?",
-		id,
-	))
+	return userByID(ctx, store.database, id)
 }
 
 func (store *Store) CreateAddress(ctx context.Context, params mailbox.CreateAddressParams) (mailbox.Address, error) {
@@ -56,7 +65,13 @@ func (store *Store) CreateAddress(ctx context.Context, params mailbox.CreateAddr
 	if err != nil {
 		return mailbox.Address{}, err
 	}
-	result, err := store.database.ExecContext(
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return mailbox.Address{}, fmt.Errorf("begin address transaction: %w", err)
+	}
+	defer transaction.Rollback()
+
+	result, err := transaction.ExecContext(
 		ctx,
 		"INSERT INTO addresses (owner_user_id, address, display_name) VALUES (?, ?, ?)",
 		params.OwnerUserID,
@@ -70,18 +85,21 @@ func (store *Store) CreateAddress(ctx context.Context, params mailbox.CreateAddr
 	if err != nil {
 		return mailbox.Address{}, fmt.Errorf("read created address ID: %w", err)
 	}
-	return store.Address(ctx, id)
+	createdAddress, err := addressByID(ctx, transaction, id)
+	if err != nil {
+		return mailbox.Address{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return mailbox.Address{}, fmt.Errorf("commit address transaction: %w", err)
+	}
+	return createdAddress, nil
 }
 
 func (store *Store) Address(ctx context.Context, id int64) (mailbox.Address, error) {
 	if id <= 0 {
 		return mailbox.Address{}, fmt.Errorf("%w: address ID must be positive", mailbox.ErrInvalid)
 	}
-	return scanAddress(store.database.QueryRowContext(
-		ctx,
-		"SELECT id, owner_user_id, address, display_name, created_at, updated_at FROM addresses WHERE id = ?",
-		id,
-	))
+	return addressByID(ctx, store.database, id)
 }
 
 func (store *Store) AddressByEmail(ctx context.Context, value string) (mailbox.Address, error) {
@@ -113,7 +131,13 @@ func (store *Store) BindProvider(
 	if err != nil {
 		return mailbox.ProviderBinding{}, err
 	}
-	result, err := store.database.ExecContext(
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return mailbox.ProviderBinding{}, fmt.Errorf("begin provider binding transaction: %w", err)
+	}
+	defer transaction.Rollback()
+
+	result, err := transaction.ExecContext(
 		ctx,
 		`INSERT INTO provider_bindings
             (address_id, provider, send_enabled, receive_enabled)
@@ -130,7 +154,14 @@ func (store *Store) BindProvider(
 	if err != nil {
 		return mailbox.ProviderBinding{}, fmt.Errorf("read provider binding ID: %w", err)
 	}
-	return store.providerBinding(ctx, id)
+	binding, err := providerBindingByID(ctx, transaction, id)
+	if err != nil {
+		return mailbox.ProviderBinding{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return mailbox.ProviderBinding{}, fmt.Errorf("commit provider binding transaction: %w", err)
+	}
+	return binding, nil
 }
 
 func (store *Store) ProviderBindings(ctx context.Context, addressID int64) ([]mailbox.ProviderBinding, error) {
@@ -162,8 +193,32 @@ func (store *Store) ProviderBindings(ctx context.Context, addressID int64) ([]ma
 	return bindings, nil
 }
 
-func (store *Store) providerBinding(ctx context.Context, id int64) (mailbox.ProviderBinding, error) {
-	return scanProviderBinding(store.database.QueryRowContext(
+type rowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func userByID(ctx context.Context, queries rowQuerier, id int64) (mailbox.User, error) {
+	return scanUser(queries.QueryRowContext(
+		ctx,
+		"SELECT id, display_name, created_at, updated_at FROM users WHERE id = ?",
+		id,
+	))
+}
+
+func addressByID(ctx context.Context, queries rowQuerier, id int64) (mailbox.Address, error) {
+	return scanAddress(queries.QueryRowContext(
+		ctx,
+		"SELECT id, owner_user_id, address, display_name, created_at, updated_at FROM addresses WHERE id = ?",
+		id,
+	))
+}
+
+func providerBindingByID(
+	ctx context.Context,
+	queries rowQuerier,
+	id int64,
+) (mailbox.ProviderBinding, error) {
+	return scanProviderBinding(queries.QueryRowContext(
 		ctx,
 		`SELECT id, address_id, provider, send_enabled, receive_enabled, created_at, updated_at
          FROM provider_bindings WHERE id = ?`,

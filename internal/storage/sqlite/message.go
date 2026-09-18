@@ -32,7 +32,16 @@ func (store *Store) Message(ctx context.Context, id int64) (mailbox.Message, err
 	if id <= 0 {
 		return mailbox.Message{}, fmt.Errorf("%w: message ID must be positive", mailbox.ErrInvalid)
 	}
-	message, err := scanMessage(store.database.QueryRowContext(
+	return messageByID(ctx, store.database, id)
+}
+
+type messageQuerier interface {
+	rowQuerier
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func messageByID(ctx context.Context, queries messageQuerier, id int64) (mailbox.Message, error) {
+	message, err := scanMessage(queries.QueryRowContext(
 		ctx,
 		`SELECT id, blob_key, blob_sha256, raw_size, header_message_id, subject,
                 envelope_from, sent_at, received_at, created_at
@@ -43,7 +52,7 @@ func (store *Store) Message(ctx context.Context, id int64) (mailbox.Message, err
 		return mailbox.Message{}, err
 	}
 
-	recipientRows, err := store.database.QueryContext(
+	recipientRows, err := queries.QueryContext(
 		ctx,
 		`SELECT address FROM message_envelope_recipients
          WHERE message_id = ? ORDER BY position`,
@@ -68,7 +77,7 @@ func (store *Store) Message(ctx context.Context, id int64) (mailbox.Message, err
 		return mailbox.Message{}, fmt.Errorf("close message envelope recipients: %w", err)
 	}
 
-	participantRows, err := store.database.QueryContext(
+	participantRows, err := queries.QueryContext(
 		ctx,
 		`SELECT kind, position, address, display_name FROM message_participants
          WHERE message_id = ? ORDER BY kind, position`,
@@ -148,17 +157,16 @@ func (store *Store) CreateMessage(
 	if err := insertMailboxMessage(ctx, transaction, messageID, uid, params); err != nil {
 		return mailbox.StoredMessage{}, err
 	}
+	message, err := messageByID(ctx, transaction, messageID)
+	if err != nil {
+		return mailbox.StoredMessage{}, err
+	}
+	membership, err := mailboxMessageByID(ctx, transaction, params.MailboxID, messageID)
+	if err != nil {
+		return mailbox.StoredMessage{}, err
+	}
 	if err := transaction.Commit(); err != nil {
 		return mailbox.StoredMessage{}, fmt.Errorf("commit message transaction: %w", err)
-	}
-
-	message, err := store.Message(ctx, messageID)
-	if err != nil {
-		return mailbox.StoredMessage{}, err
-	}
-	membership, err := store.mailboxMessage(ctx, params.MailboxID, messageID)
-	if err != nil {
-		return mailbox.StoredMessage{}, err
 	}
 	return mailbox.StoredMessage{Message: message, MailboxMessage: membership}, nil
 }
@@ -339,12 +347,13 @@ func insertMailboxMessage(
 	return nil
 }
 
-func (store *Store) mailboxMessage(
+func mailboxMessageByID(
 	ctx context.Context,
+	queries rowQuerier,
 	mailboxID int64,
 	messageID int64,
 ) (mailbox.MailboxMessage, error) {
-	return scanMailboxMessage(store.database.QueryRowContext(
+	return scanMailboxMessage(queries.QueryRowContext(
 		ctx,
 		`SELECT mailbox_id, message_id, uid, seen, answered, flagged, deleted, draft,
                 internal_date, created_at

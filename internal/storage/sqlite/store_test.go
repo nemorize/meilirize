@@ -374,6 +374,62 @@ func TestCreateMessageRollsBackMetadataAndUIDOnFailure(t *testing.T) {
 	}
 }
 
+func TestCreateMessageRollsBackWhenResultCannotBeAssembled(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "result-failure@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.database.ExecContext(ctx, `
+		CREATE TRIGGER corrupt_created_message
+		AFTER INSERT ON messages
+		BEGIN
+			UPDATE messages SET created_at = 'invalid' WHERE id = NEW.id;
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	_, err = store.CreateMessage(ctx, mailbox.CreateMessageParams{
+		MailboxID:    inbox.ID,
+		BlobKey:      "sha256/" + strings.Repeat("0", 64),
+		BlobSHA256:   strings.Repeat("0", 64),
+		ReceivedAt:   now,
+		InternalDate: now,
+	})
+	if err == nil || !strings.Contains(err.Error(), "parse SQLite timestamp") {
+		t.Fatalf("CreateMessage error = %v", err)
+	}
+
+	assertTableCount(t, store.database, "messages", 0)
+	assertTableCount(t, store.database, "mailbox_messages", 0)
+	unchangedInbox, err := store.MailboxByName(ctx, address.ID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchangedInbox.UIDNext != 1 {
+		t.Fatalf("UIDNEXT after result assembly failure = %d", unchangedInbox.UIDNext)
+	}
+}
+
 func TestFailedIngestBlobsAreCollected(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
@@ -630,6 +686,83 @@ func TestStorePersistsMailboxOwnershipAndProviderBindings(t *testing.T) {
 	if len(bindings) != 1 || bindings[0].ID != binding.ID {
 		t.Fatalf("provider bindings = %#v", bindings)
 	}
+}
+
+func TestIdentityCreatesRollBackWhenResultsCannotBeAssembled(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "mailbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, err := store.database.ExecContext(ctx, `
+		CREATE TRIGGER corrupt_created_user
+		AFTER INSERT ON users
+		BEGIN
+			UPDATE users SET created_at = 'invalid' WHERE id = NEW.id;
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateUser(ctx, mailbox.CreateUserParams{}); err == nil ||
+		!strings.Contains(err.Error(), "parse SQLite timestamp") {
+		t.Fatalf("CreateUser error = %v", err)
+	}
+	assertTableCount(t, store.database, "users", 0)
+	if _, err := store.database.ExecContext(ctx, "DROP TRIGGER corrupt_created_user"); err != nil {
+		t.Fatal(err)
+	}
+
+	user, err := store.CreateUser(ctx, mailbox.CreateUserParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.database.ExecContext(ctx, `
+		CREATE TRIGGER corrupt_created_address
+		AFTER INSERT ON addresses
+		BEGIN
+			UPDATE addresses SET created_at = 'invalid' WHERE id = NEW.id;
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "broken@example.com",
+	}); err == nil || !strings.Contains(err.Error(), "parse SQLite timestamp") {
+		t.Fatalf("CreateAddress error = %v", err)
+	}
+	assertTableCount(t, store.database, "addresses", 0)
+	assertTableCount(t, store.database, "mailboxes", 0)
+	if _, err := store.database.ExecContext(ctx, "DROP TRIGGER corrupt_created_address"); err != nil {
+		t.Fatal(err)
+	}
+
+	address, err := store.CreateAddress(ctx, mailbox.CreateAddressParams{
+		OwnerUserID: user.ID,
+		Address:     "working@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.database.ExecContext(ctx, `
+		CREATE TRIGGER corrupt_created_provider_binding
+		AFTER INSERT ON provider_bindings
+		BEGIN
+			UPDATE provider_bindings SET created_at = 'invalid' WHERE id = NEW.id;
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BindProvider(ctx, mailbox.BindProviderParams{
+		AddressID:   address.ID,
+		Provider:    "example",
+		SendEnabled: true,
+	}); err == nil || !strings.Contains(err.Error(), "parse SQLite timestamp") {
+		t.Fatalf("BindProvider error = %v", err)
+	}
+	assertTableCount(t, store.database, "provider_bindings", 0)
 }
 
 func TestStoreEnforcesMailboxRelationships(t *testing.T) {
