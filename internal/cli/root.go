@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"meilirize/internal/buildinfo"
+	"meilirize/internal/config"
 )
 
 const (
@@ -32,6 +33,8 @@ func Execute(
 }
 
 func NewRootCommand(info buildinfo.Info) *cobra.Command {
+	var configPath string
+
 	root := &cobra.Command{
 		Use:           "meilirize",
 		Short:         "A self-hosted mailbox backed by email APIs",
@@ -49,11 +52,17 @@ func NewRootCommand(info buildinfo.Info) *cobra.Command {
 	)
 	root.SetHelpCommandGroupID(groupUtility)
 	root.SetCompletionCommandGroupID(groupUtility)
+	root.PersistentFlags().StringVar(
+		&configPath,
+		"config",
+		"",
+		"configuration file path",
+	)
 
 	root.AddCommand(
 		newPlaceholderCommand("serve", "Run the server in the foreground", groupRuntime),
 		newPlaceholderCommand("doctor", "Check whether the service is ready to run", groupRuntime),
-		newConfigCommand(),
+		newConfigCommand(&configPath, config.NewResolver),
 		newUserCommand(),
 		newAddressCommand(),
 		newProviderCommand(),

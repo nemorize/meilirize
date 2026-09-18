@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"meilirize/internal/buildinfo"
+	"meilirize/internal/config"
 )
 
 var testBuild = buildinfo.Info{
@@ -34,6 +37,7 @@ func TestRootHelpListsCommandGroups(t *testing.T) {
 		"Utilities",
 		"version",
 		"completion",
+		"--config string",
 	} {
 		if !strings.Contains(output, expected) {
 			t.Errorf("help does not contain %q:\n%s", expected, output)
@@ -84,6 +88,52 @@ func TestNestedCommandsAreRegistered(t *testing.T) {
 		if len(remaining) != 0 || command.Name() != commandPath[len(commandPath)-1] {
 			t.Fatalf("find %v returned %q with remaining %v", commandPath, command.Name(), remaining)
 		}
+	}
+}
+
+func TestConfigShowUsesExplicitFileAndEnvironment(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[server]\nport = 2525\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := executeForTest("config", "show", "--config", configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"File: " + configPath,
+		"File selection: --config",
+		"Environment: MEILIRIZE_*",
+		"Precedence: flags > environment > file > defaults",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("output does not contain %q:\n%s", expected, output)
+		}
+	}
+}
+
+func TestExplicitConfigFileDoesNotInitializeAutomaticDiscovery(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resolverCalled := false
+	factory := func() (config.Resolver, error) {
+		resolverCalled = true
+		return config.Resolver{}, nil
+	}
+
+	sources, err := resolveConfigSources(configPath, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolverCalled {
+		t.Fatal("automatic discovery was initialized for an explicit selector")
+	}
+	if sources.FilePath != configPath || sources.FileSelection != config.FileSelectedByFlag {
+		t.Fatalf("unexpected sources: %+v", sources)
 	}
 }
 
